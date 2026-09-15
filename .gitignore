@@ -1,0 +1,6 @@
+zig-out/
+.zig-cache/
+bpf/vmlinux.h
+bpf/*.o
+bench/floodgen
+/tmp/
