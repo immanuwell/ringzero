@@ -35,12 +35,18 @@ fn parseIp(s: []const u8) !u32 {
     return result;
 }
 
+/// `addr_be` holds the four dotted-quad octets in network-byte-order as raw
+/// memory (written by inet_pton), reinterpreted as a native u32. On our
+/// little-endian host that makes the *first* transmitted octet the
+/// *least*-significant byte of the integer -- the reverse of the usual
+/// "network byte order = big endian = MSB first" framing, which is exactly
+/// why the classic footgun is doing the shift the other way around.
 fn ipToStr(buf: []u8, addr_be: u32) ![]u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-        (addr_be >> 24) & 0xff,
-        (addr_be >> 16) & 0xff,
-        (addr_be >> 8) & 0xff,
         addr_be & 0xff,
+        (addr_be >> 8) & 0xff,
+        (addr_be >> 16) & 0xff,
+        (addr_be >> 24) & 0xff,
     });
 }
 
