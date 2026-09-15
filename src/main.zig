@@ -312,7 +312,20 @@ fn cmdDetach(flags: Flags) !void {
     const iface = flags.getReq("--iface");
     const pindir = flags.getDefault("--pindir", default_pindir);
     const ifindex = try ifNameToIndex(iface);
-    const ret = c.bpf_xdp_detach(@intCast(ifindex), 0, null);
+
+    // bpf_xdp_detach(flags=0) doesn't reliably auto-detect which mode is
+    // currently attached on every kernel/libbpf combination -- query first
+    // and detach with the matching flag so this works whether `attach` fell
+    // back to generic mode or not.
+    var prog_id: u32 = 0;
+    var mode_flags: u32 = 0;
+    if (c.bpf_xdp_query_id(@intCast(ifindex), c.XDP_FLAGS_DRV_MODE, &prog_id) == 0 and prog_id != 0) {
+        mode_flags = c.XDP_FLAGS_DRV_MODE;
+    } else if (c.bpf_xdp_query_id(@intCast(ifindex), c.XDP_FLAGS_SKB_MODE, &prog_id) == 0 and prog_id != 0) {
+        mode_flags = c.XDP_FLAGS_SKB_MODE;
+    }
+
+    const ret = c.bpf_xdp_detach(@intCast(ifindex), mode_flags, null);
     if (ret != 0) fatal("bpf_xdp_detach failed: {d}", .{ret});
     std.debug.print("detached xdp program from {s}\n", .{iface});
 
