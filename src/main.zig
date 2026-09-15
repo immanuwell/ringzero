@@ -316,6 +316,95 @@ fn cmdDetach(flags: Flags) !void {
     }
 }
 
+fn cmdVipAdd(flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const addr = try parseIp(flags.getReq("--vip"));
+    const port_num = try std.fmt.parseInt(u16, flags.getReq("--port"), 10);
+    const proto = try parseProto(flags.getReq("--proto"));
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    const vip_id = try nextFreeVipId(maps.vip);
+    var key = std.mem.zeroes(c.struct_vip_key);
+    key.vip_addr = addr;
+    key.vip_port = std.mem.nativeToBig(u16, port_num);
+    key.proto = proto;
+
+    var info = std.mem.zeroes(c.struct_vip_info);
+    info.vip_id = vip_id;
+    info.backend_count = 0;
+
+    if (c.bpf_map_update_elem(maps.vip, &key, &info, c.BPF_NOEXIST) != 0)
+        fatal("vip already exists (or vip_map update failed)", .{});
+
+    std.debug.print("added vip {s}:{d}/{s} -> vip_id {d}\n", .{ flags.getReq("--vip"), port_num, protoName(proto), vip_id });
+}
+
+fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const vip_spec = try parseVipSpec(flags.getReq("--vip"));
+    const addr = try parseIp(flags.getReq("--addr"));
+    const mac = try parseMac(flags.getReq("--mac"));
+    const router_mac = try parseMac(flags.getReq("--router-mac"));
+    const egress_iface = flags.getReq("--iface");
+    const ifindex = try ifNameToIndex(egress_iface);
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    var vkey = std.mem.zeroes(c.struct_vip_key);
+    vkey.vip_addr = vip_spec.addr;
+    vkey.vip_port = vip_spec.port;
+    vkey.proto = vip_spec.proto;
+    var vinfo: c.struct_vip_info = undefined;
+    if (c.bpf_map_lookup_elem(maps.vip, &vkey, &vinfo) != 0)
+        fatal("vip not found -- run `vip-add` first", .{});
+
+    const backend_id = try nextFreeBackendId(maps.backend);
+    var be = std.mem.zeroes(c.struct_backend);
+    be.addr = addr;
+    be.mac = mac;
+    be.router_mac = router_mac;
+    be.ifindex_egress = ifindex;
+    be.vip_id = vinfo.vip_id;
+    be.port = vip_spec.port;
+    be.proto = vip_spec.proto;
+    be.flags = c.BACKEND_FLAG_HEALTHY;
+
+    if (c.bpf_map_update_elem(maps.backend, &backend_id, &be, c.BPF_ANY) != 0)
+        fatal("backend_map update failed", .{});
+
+    vinfo.backend_count += 1;
+    _ = c.bpf_map_update_elem(maps.vip, &vkey, &vinfo, c.BPF_EXIST);
+
+    std.debug.print("added backend_id {d}: {s} (mac {s}) via {s} for vip_id {d}\n", .{
+        backend_id, flags.getReq("--addr"), flags.getReq("--mac"), egress_iface, vinfo.vip_id,
+    });
+
+    try rebuildMaglev(allocator, maps, vinfo.vip_id);
+}
+
+fn cmdBackendSet(allocator: std.mem.Allocator, flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const id = try std.fmt.parseInt(u32, flags.getReq("--id"), 10);
+    const up = flags.has("--up");
+    const down = flags.has("--down");
+    if (up == down) fatal("specify exactly one of --up / --down", .{});
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    var be: c.struct_backend = undefined;
+    if (c.bpf_map_lookup_elem(maps.backend, &id, &be) != 0) fatal("no such backend id {d}", .{id});
+
+    if (up) be.flags |= c.BACKEND_FLAG_HEALTHY else be.flags &= ~@as(u8, c.BACKEND_FLAG_HEALTHY);
+    if (c.bpf_map_update_elem(maps.backend, &id, &be, c.BPF_EXIST) != 0) fatal("update failed", .{});
+
+    std.debug.print("backend {d} marked {s}\n", .{ id, if (up) "UP" else "DOWN" });
+    try rebuildMaglev(allocator, maps, be.vip_id);
+}
+
 fn printUsage() void {
     std.debug.print(
         \\ringzero -- control plane for the XDP load balancer
@@ -323,6 +412,9 @@ fn printUsage() void {
         \\usage:
         \\  ringzero attach --iface IFACE [--obj bpf/xdp_lb.o] [--mode auto|native|generic] [--pindir DIR]
         \\  ringzero detach --iface IFACE [--purge] [--pindir DIR]
+        \\  ringzero vip-add --vip IP --port PORT --proto tcp|udp [--pindir DIR]
+        \\  ringzero backend-add --vip IP:PORT/proto --addr IP --mac MAC --router-mac MAC --iface IFACE [--pindir DIR]
+        \\  ringzero backend-set --id ID (--up|--down) [--pindir DIR]
         \\
     , .{});
 }
@@ -348,6 +440,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try cmdAttach(flags);
     } else if (std.mem.eql(u8, cmd, "detach")) {
         try cmdDetach(flags);
+    } else if (std.mem.eql(u8, cmd, "vip-add")) {
+        try cmdVipAdd(flags);
+    } else if (std.mem.eql(u8, cmd, "backend-add")) {
+        try cmdBackendAdd(allocator, flags);
+    } else if (std.mem.eql(u8, cmd, "backend-set")) {
+        try cmdBackendSet(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         printUsage();
     } else {
