@@ -255,9 +255,74 @@ fn rebuildMaglev(allocator: std.mem.Allocator, maps: Maps, vip_id: u32) !void {
 // subcommands (more to come)
 // ---------------------------------------------------------------------------
 
+fn cmdAttach(flags: Flags) !void {
+    const iface = flags.getReq("--iface");
+    const obj_path = flags.getDefault("--obj", default_obj);
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const mode = flags.getDefault("--mode", "auto");
+
+    var obj_buf: [512]u8 = undefined;
+    const obj_z = try std.fmt.bufPrintZ(&obj_buf, "{s}", .{obj_path});
+    const obj = c.bpf_object__open(obj_z.ptr) orelse fatal("bpf_object__open({s}) failed", .{obj_path});
+
+    if (c.bpf_object__load(obj) != 0) fatal("bpf_object__load failed (check dmesg / verifier log)", .{});
+
+    var prog_buf: [64]u8 = undefined;
+    const prog_z = try std.fmt.bufPrintZ(&prog_buf, "{s}", .{prog_name});
+    const prog = c.bpf_object__find_program_by_name(obj, prog_z.ptr) orelse fatal("program {s} not found in object", .{prog_name});
+    const prog_fd = c.bpf_program__fd(prog);
+    if (prog_fd < 0) fatal("bpf_program__fd failed", .{});
+
+    mkdirIfMissing(pindir);
+    var pin_buf: [512]u8 = undefined;
+    const pin_z = try std.fmt.bufPrintZ(&pin_buf, "{s}", .{pindir});
+    const pin_ret = c.bpf_object__pin_maps(obj, pin_z.ptr);
+    if (pin_ret != 0) fatal("bpf_object__pin_maps({s}) failed: {d} (maps already pinned from a previous attach? try `detach --purge` first)", .{ pindir, pin_ret });
+
+    const ifindex = try ifNameToIndex(iface);
+
+    const drv_flags: u32 = c.XDP_FLAGS_UPDATE_IF_NOEXIST | c.XDP_FLAGS_DRV_MODE;
+    const skb_flags: u32 = c.XDP_FLAGS_UPDATE_IF_NOEXIST | c.XDP_FLAGS_SKB_MODE;
+
+    var used_mode: []const u8 = "native (driver, XDP_FLAGS_DRV_MODE)";
+    var ret: c_int = -1;
+    if (std.mem.eql(u8, mode, "native") or std.mem.eql(u8, mode, "auto")) {
+        ret = c.bpf_xdp_attach(@intCast(ifindex), prog_fd, drv_flags, null);
+    }
+    if (ret != 0 and (std.mem.eql(u8, mode, "generic") or std.mem.eql(u8, mode, "auto"))) {
+        ret = c.bpf_xdp_attach(@intCast(ifindex), prog_fd, skb_flags, null);
+        used_mode = "generic (SKB, XDP_FLAGS_SKB_MODE)";
+    }
+    if (ret != 0) fatal("bpf_xdp_attach on {s} (ifindex {d}) failed: {d}. Native XDP needs NIC driver support; try --mode generic.", .{ iface, ifindex, ret });
+
+    std.debug.print(
+        \\attached xdp_lb_prog to {s} (ifindex {d}) in {s} mode
+        \\maps pinned under {s}
+        \\
+    , .{ iface, ifindex, used_mode, pindir });
+}
+
+fn cmdDetach(flags: Flags) !void {
+    const iface = flags.getReq("--iface");
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const ifindex = try ifNameToIndex(iface);
+    const ret = c.bpf_xdp_detach(@intCast(ifindex), 0, null);
+    if (ret != 0) fatal("bpf_xdp_detach failed: {d}", .{ret});
+    std.debug.print("detached xdp program from {s}\n", .{iface});
+
+    if (flags.has("--purge")) {
+        purgePinDir(pindir);
+        std.debug.print("removed pinned maps under {s}\n", .{pindir});
+    }
+}
+
 fn printUsage() void {
     std.debug.print(
         \\ringzero -- control plane for the XDP load balancer
+        \\
+        \\usage:
+        \\  ringzero attach --iface IFACE [--obj bpf/xdp_lb.o] [--mode auto|native|generic] [--pindir DIR]
+        \\  ringzero detach --iface IFACE [--purge] [--pindir DIR]
         \\
     , .{});
 }
@@ -277,7 +342,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const cmd = argv[1];
-    if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
+    const flags = Flags{ .args = argv[2..] };
+
+    if (std.mem.eql(u8, cmd, "attach")) {
+        try cmdAttach(flags);
+    } else if (std.mem.eql(u8, cmd, "detach")) {
+        try cmdDetach(flags);
+    } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         printUsage();
     } else {
         std.debug.print("unknown command: {s}\n\n", .{cmd});
