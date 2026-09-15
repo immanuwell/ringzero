@@ -493,6 +493,89 @@ fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
     }
 }
 
+/// TCP-only health checking: attempts a short, non-blocking connect() to
+/// each backend's (addr, port). UDP backends have no reliable protocol-level
+/// reachability probe without an application-specific echo, so they are
+/// always treated as healthy here -- flip them manually with `backend-set`
+/// if you need to simulate a failure in the demo. A real deployment would
+/// plug in an app-aware check here (HTTP /healthz, a UDP echo, etc.).
+fn checkTcpHealthy(addr_be: u32, port_be: u16, timeout_ms: i32) bool {
+    const sock = c.socket(c.AF_INET, c.SOCK_STREAM | c.SOCK_NONBLOCK, 0);
+    if (sock < 0) return false;
+    defer _ = c.close(sock);
+
+    var sa = std.mem.zeroes(c.struct_sockaddr_in);
+    sa.sin_family = c.AF_INET;
+    sa.sin_port = port_be;
+    sa.sin_addr.s_addr = addr_be;
+
+    const ret = c.connect(sock, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in));
+    if (ret != 0 and c.__errno_location().* != c.EINPROGRESS) return false;
+
+    var pfd = [_]c.struct_pollfd{.{ .fd = sock, .events = c.POLLOUT, .revents = 0 }};
+    const n = c.poll(&pfd, 1, timeout_ms);
+    if (n <= 0) return false;
+
+    var opt: c_int = 0;
+    var opt_len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(sock, c.SOL_SOCKET, c.SO_ERROR, @ptrCast(&opt), &opt_len) != 0) return false;
+    return opt == 0;
+}
+
+fn cmdHealthcheck(allocator: std.mem.Allocator, flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const interval_s = try std.fmt.parseFloat(f64, flags.getDefault("--interval", "2.0"));
+    const timeout_ms = try std.fmt.parseInt(i32, flags.getDefault("--timeout-ms", "300"), 10);
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    std.debug.print("healthcheck loop started (interval={d}s, tcp timeout={d}ms)\n", .{ interval_s, timeout_ms });
+
+    while (true) {
+        var dirty_vips = std.array_list.Managed(u32).init(allocator);
+        defer dirty_vips.deinit();
+
+        var key: u32 = undefined;
+        var next_key: u32 = undefined;
+        var have_key = false;
+        while (true) {
+            const key_ptr: ?*u32 = if (have_key) &key else null;
+            if (c.bpf_map_get_next_key(maps.backend, key_ptr, &next_key) != 0) break;
+            key = next_key;
+            have_key = true;
+
+            var be: c.struct_backend = undefined;
+            if (c.bpf_map_lookup_elem(maps.backend, &key, &be) != 0) continue;
+
+            const was_healthy = be.flags & c.BACKEND_FLAG_HEALTHY != 0;
+            const now_healthy = if (be.proto == c.IPPROTO_TCP_)
+                checkTcpHealthy(be.addr, be.port, timeout_ms)
+            else
+                true;
+
+            if (now_healthy != was_healthy) {
+                if (now_healthy) be.flags |= c.BACKEND_FLAG_HEALTHY else be.flags &= ~@as(u8, c.BACKEND_FLAG_HEALTHY);
+                _ = c.bpf_map_update_elem(maps.backend, &key, &be, c.BPF_EXIST);
+                var ipbuf: [16]u8 = undefined;
+                const ipstr = ipToStr(&ipbuf, be.addr) catch "?";
+                std.debug.print("backend {d} ({s}) transitioned to {s}\n", .{ key, ipstr, if (now_healthy) "UP" else "DOWN" });
+                var found = false;
+                for (dirty_vips.items) |v| {
+                    if (v == be.vip_id) found = true;
+                }
+                if (!found) try dirty_vips.append(be.vip_id);
+            }
+        }
+
+        for (dirty_vips.items) |vip_id| {
+            try rebuildMaglev(allocator, maps, vip_id);
+        }
+
+        _ = c.usleep(@intFromFloat(interval_s * 1_000_000.0));
+    }
+}
+
 fn printUsage() void {
     std.debug.print(
         \\ringzero -- control plane for the XDP load balancer
@@ -505,6 +588,7 @@ fn printUsage() void {
         \\  ringzero backend-set --id ID (--up|--down) [--pindir DIR]
         \\  ringzero list [--pindir DIR]
         \\  ringzero stats [--watch] [--interval SEC] [--pindir DIR]
+        \\  ringzero healthcheck [--interval SEC] [--timeout-ms MS] [--pindir DIR]
         \\
     , .{});
 }
@@ -540,6 +624,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try cmdList(flags);
     } else if (std.mem.eql(u8, cmd, "stats")) {
         try cmdStats(allocator, flags);
+    } else if (std.mem.eql(u8, cmd, "healthcheck")) {
+        try cmdHealthcheck(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         printUsage();
     } else {
