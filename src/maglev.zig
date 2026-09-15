@@ -61,3 +61,25 @@ pub fn build(allocator: std.mem.Allocator, backend_ids: []const u32, table_size:
         }
     }
 }
+
+test "maglev distributes and is deterministic" {
+    const allocator = std.testing.allocator;
+    const table_size: u32 = 4099;
+    const table = try allocator.alloc(i64, table_size);
+    defer allocator.free(table);
+
+    const backends = [_]u32{ 1, 2, 3, 4 };
+    try build(allocator, &backends, table_size, table);
+
+    var counts = [_]u32{0} ** 4;
+    for (table) |slot| {
+        try std.testing.expect(slot >= 0 and slot < 4);
+        counts[@intCast(slot)] += 1;
+    }
+    // Each backend should get roughly table_size/4 slots (within 15%).
+    for (counts) |cnt| {
+        const expected: f64 = @as(f64, @floatFromInt(table_size)) / 4.0;
+        const ratio = @as(f64, @floatFromInt(cnt)) / expected;
+        try std.testing.expect(ratio > 0.85 and ratio < 1.15);
+    }
+}
