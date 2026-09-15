@@ -405,6 +405,94 @@ fn cmdBackendSet(allocator: std.mem.Allocator, flags: Flags) !void {
     try rebuildMaglev(allocator, maps, be.vip_id);
 }
 
+fn cmdList(flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    std.debug.print("VIPs:\n", .{});
+    var vkey: c.struct_vip_key = undefined;
+    var vnext: c.struct_vip_key = undefined;
+    var have_vkey = false;
+    while (true) {
+        const key_ptr: ?*c.struct_vip_key = if (have_vkey) &vkey else null;
+        if (c.bpf_map_get_next_key(maps.vip, key_ptr, &vnext) != 0) break;
+        vkey = vnext;
+        have_vkey = true;
+        var info: c.struct_vip_info = undefined;
+        if (c.bpf_map_lookup_elem(maps.vip, &vkey, &info) != 0) continue;
+        var ipbuf: [16]u8 = undefined;
+        const ipstr = try ipToStr(&ipbuf, vkey.vip_addr);
+        std.debug.print("  vip_id={d}  {s}:{d}/{s}  backends={d}\n", .{
+            info.vip_id, ipstr, std.mem.bigToNative(u16, vkey.vip_port), protoName(vkey.proto), info.backend_count,
+        });
+    }
+
+    std.debug.print("Backends:\n", .{});
+    var bkey: u32 = undefined;
+    var bnext: u32 = undefined;
+    var have_bkey = false;
+    while (true) {
+        const key_ptr: ?*u32 = if (have_bkey) &bkey else null;
+        if (c.bpf_map_get_next_key(maps.backend, key_ptr, &bnext) != 0) break;
+        bkey = bnext;
+        have_bkey = true;
+        var be: c.struct_backend = undefined;
+        if (c.bpf_map_lookup_elem(maps.backend, &bkey, &be) != 0) continue;
+        var ipbuf: [16]u8 = undefined;
+        const ipstr = try ipToStr(&ipbuf, be.addr);
+        var macbuf: [18]u8 = undefined;
+        const macstr = try macToStr(&macbuf, be.mac);
+        std.debug.print("  id={d}  {s}:{d}/{s}  mac={s}  egress_ifindex={d}  vip_id={d}  {s}\n", .{
+            bkey, ipstr, std.mem.bigToNative(u16, be.port), protoName(be.proto), macstr, be.ifindex_egress, be.vip_id,
+            if (be.flags & c.BACKEND_FLAG_HEALTHY != 0) "UP" else "DOWN",
+        });
+    }
+}
+
+fn readStatsSummed(fd: c_int, idx: u32, ncpu: usize, allocator: std.mem.Allocator) !c.struct_lb_stats {
+    const buf = try allocator.alloc(c.struct_lb_stats, ncpu);
+    defer allocator.free(buf);
+    @memset(std.mem.sliceAsBytes(buf), 0);
+    if (c.bpf_map_lookup_elem(fd, &idx, buf.ptr) != 0) return std.mem.zeroes(c.struct_lb_stats);
+    var total = std.mem.zeroes(c.struct_lb_stats);
+    for (buf) |s| {
+        total.packets += s.packets;
+        total.bytes += s.bytes;
+        total.dropped += s.dropped;
+        total.passed += s.passed;
+    }
+    return total;
+}
+
+fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const watch = flags.has("--watch");
+    const interval_s = try std.fmt.parseFloat(f64, flags.getDefault("--interval", "1.0"));
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    const ncpu: usize = @intCast(c.libbpf_num_possible_cpus());
+
+    var prev = std.mem.zeroes(c.struct_lb_stats);
+    var first = true;
+    while (true) {
+        const cur = try readStatsSummed(maps.stats, c.STATS_GLOBAL_IDX, ncpu, allocator);
+        const dp = if (first) 0 else cur.packets - prev.packets;
+        const db = if (first) 0 else cur.bytes - prev.bytes;
+        const pps = @as(f64, @floatFromInt(dp)) / interval_s;
+        const bps = @as(f64, @floatFromInt(db)) / interval_s;
+        std.debug.print("packets={d:>12} bytes={d:>14} dropped={d:>10} passed={d:>10}  |  {d:>12.0} pps  {d:>10.2} Mbps\n", .{
+            cur.packets, cur.bytes, cur.dropped, cur.passed, pps, bps * 8.0 / 1_000_000.0,
+        });
+        prev = cur;
+        first = false;
+        if (!watch) break;
+        _ = c.usleep(@intFromFloat(interval_s * 1_000_000.0));
+    }
+}
+
 fn printUsage() void {
     std.debug.print(
         \\ringzero -- control plane for the XDP load balancer
@@ -415,6 +503,8 @@ fn printUsage() void {
         \\  ringzero vip-add --vip IP --port PORT --proto tcp|udp [--pindir DIR]
         \\  ringzero backend-add --vip IP:PORT/proto --addr IP --mac MAC --router-mac MAC --iface IFACE [--pindir DIR]
         \\  ringzero backend-set --id ID (--up|--down) [--pindir DIR]
+        \\  ringzero list [--pindir DIR]
+        \\  ringzero stats [--watch] [--interval SEC] [--pindir DIR]
         \\
     , .{});
 }
@@ -446,6 +536,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try cmdBackendAdd(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "backend-set")) {
         try cmdBackendSet(allocator, flags);
+    } else if (std.mem.eql(u8, cmd, "list")) {
+        try cmdList(flags);
+    } else if (std.mem.eql(u8, cmd, "stats")) {
+        try cmdStats(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "--help")) {
         printUsage();
     } else {
