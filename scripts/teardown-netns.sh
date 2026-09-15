@@ -4,7 +4,7 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for f in /tmp/proxy-lb-backend1.pid /tmp/proxy-lb-backend2.pid; do
+for f in /tmp/ringzero-backend1.pid /tmp/ringzero-backend2.pid; do
     if [ -f "$f" ]; then
         kill "$(cat "$f")" 2>/dev/null
         rm -f "$f"

@@ -1,0 +1,43 @@
+flowchart LR
+    Client(["Client"])
+
+    subgraph KERNEL["Kernel — ring 0"]
+        direction TB
+        NIC["NIC driver RX poll loop"]
+        XDP["xdp_lb_prog (eBPF)"]
+        VIPMAP[("vip_map")]
+        MAGLEVMAP[("maglev_map<br/>(Maglev table)")]
+        BACKENDMAP[("backend_map")]
+        STATSMAP[("stats_map<br/>(per-CPU)")]
+
+        NIC -- "raw frame,<br/>no sk_buff yet" --> XDP
+        XDP -- "① match dst ip:port:proto" --> VIPMAP
+        XDP -- "② hash 5-tuple → slot" --> MAGLEVMAP
+        XDP -- "③ resolve backend" --> BACKENDMAP
+        XDP -. "④ bump counters" .-> STATSMAP
+    end
+
+    subgraph USERSPACE["Userspace control plane"]
+        CLI["ringzero CLI<br/>attach · vip-add · backend-add<br/>backend-set · healthcheck · stats"]
+    end
+
+    Backend1(["Backend"])
+
+    Client -- "packet → VIP" --> NIC
+    XDP -- "⑤ DNAT + bpf_redirect()" --> Backend1
+
+    CLI -. "load program<br/>+ pin maps" .-> XDP
+    CLI -. "writes" .-> VIPMAP
+    CLI -. "writes" .-> BACKENDMAP
+    CLI -. "rebuilds" .-> MAGLEVMAP
+    CLI -. "reads" .-> STATSMAP
+
+    classDef kernel fill:#fdecea,stroke:#c0392b,stroke-width:2px,color:#7a2718;
+    classDef map fill:#fff8e1,stroke:#b7891a,stroke-width:2px,color:#5c4413;
+    classDef user fill:#eaf2fd,stroke:#2f6fb3,stroke-width:2px,color:#1c4c7a;
+    classDef ext fill:#f2f2f2,stroke:#888,stroke-width:2px,color:#333;
+
+    class NIC,XDP kernel;
+    class VIPMAP,MAGLEVMAP,BACKENDMAP,STATSMAP map;
+    class CLI user;
+    class Client,Backend1 ext;

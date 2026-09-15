@@ -3,4 +3,18 @@ zig-out/
 bpf/vmlinux.h
 bpf/*.o
 bench/floodgen
-/tmp/
+
+# packet captures from local debugging (tcpdump / raw-socket dumps)
+*.pcap
+*.pcapng
+
+# editor and OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# core dumps
+core

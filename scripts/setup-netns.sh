@@ -100,11 +100,11 @@ ip netns exec client ip neigh replace "$VIP" lladdr "$ROUTER_MAC" dev veth-c-pee
 # which sidesteps the rest of the network stack entirely.
 echo "== starting UDP sink listeners on backends (best-effort, see note in script) =="
 ip netns exec backend1 python3 -u "$here/scripts/udp_sink.py" "${BACKEND1_IP%/*}" "$VIP_PORT" \
-    > /tmp/proxy-lb-backend1.log 2>&1 &
-echo $! > /tmp/proxy-lb-backend1.pid
+    > /tmp/ringzero-backend1.log 2>&1 &
+echo $! > /tmp/ringzero-backend1.pid
 ip netns exec backend2 python3 -u "$here/scripts/udp_sink.py" "${BACKEND2_IP%/*}" "$VIP_PORT" \
-    > /tmp/proxy-lb-backend2.log 2>&1 &
-echo $! > /tmp/proxy-lb-backend2.pid
+    > /tmp/ringzero-backend2.log 2>&1 &
+echo $! > /tmp/ringzero-backend2.pid
 
 echo "== loading and attaching the XDP program =="
 "$here/zig-out/bin/ringzero" attach --iface veth-c --mode native
