@@ -115,7 +115,7 @@ sudo ./scripts/verify_datapath.py --prog-id <id> \
     --vip 10.99.0.1 --vip-port 9000 --proto udp --expect-dst 10.20.0.2
 ```
 
-This builds a real Ethernet, IP, and UDP packet, runs it through the loaded program, and checks that the rewritten packet has a valid checksum and the right backend as its destination. This is how the checksum logic in `xdp_lb.c` was actually tested during development, and it's a good technique on its own. `bpftool prog run` lets you test a BPF program the way you'd test any function, without needing a working network path around it.
+This builds a real Ethernet, IP, and UDP packet, runs it through the loaded program, and checks that the rewritten packet has a valid checksum and the right backend as its destination. `bpftool prog run` lets you test a BPF program the way you'd test any function, without needing a working network path around it.
 
 ## About the numbers
 
@@ -133,4 +133,4 @@ To get near what the project's name promises, you need what Katran actually runs
 
 ## License
 
-No license file yet. Add one before relying on this for anything beyond learning eBPF.
+No license yet. All rights reserved by default until one is added.
