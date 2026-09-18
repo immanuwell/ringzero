@@ -245,7 +245,7 @@ int xdp_lb_prog(struct xdp_md *ctx)
         tcph->check = new_csum;
     } else if (udph && udph->check != 0) {
         __u16 new_csum = csum_diff4(old_daddr, new_daddr, udph->check);
-        udph->check = new_csum;
+        udph->check = new_csum ? new_csum : 0xffff;
     }
 
     __builtin_memcpy(eth->h_dest, be->mac, 6);
