@@ -9,6 +9,7 @@ pub const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("poll.h");
     @cInclude("sys/stat.h");
+    @cInclude("sys/file.h");
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
     @cInclude("net/if.h");

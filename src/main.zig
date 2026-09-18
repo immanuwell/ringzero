@@ -204,6 +204,51 @@ fn purgePinDir(pindir: []const u8) void {
     _ = c.rmdir(dz.ptr);
 }
 
+/// Serializes the mutating commands -- they're all read-modify-write over the
+/// maps, and `healthcheck` runs one in a loop. Not under --pindir: bpffs
+/// rejects O_CREAT of a regular file.
+const lock_path = "/run/ringzero.lock";
+const lock_wait_ms = 2000;
+
+/// Null if another command held the lock past lock_wait_ms.
+fn tryLockControlPlane() ?c_int {
+    const fd = c.open(lock_path, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o644));
+    // No lock file at all is how things worked before there was a lock, so
+    // that still runs, just unserialized. Contention is different: another
+    // command is mid-update, and going ahead would interleave with it.
+    if (fd < 0) {
+        std.debug.print("warning: no {s}, running unserialized\n", .{lock_path});
+        return -1;
+    }
+    // Bounded so a stuck holder cannot turn a command that never blocked into
+    // a hang -- but give up rather than mutate unserialized, since every
+    // update is read-modify-write and update_batch is not atomic either.
+    var waited: u32 = 0;
+    while (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
+        const err = std.c._errno().*;
+        if (err != c.EWOULDBLOCK and err != c.EINTR)
+            fatal("flock({s}) failed: errno {d}", .{ lock_path, err });
+        if (waited >= lock_wait_ms) {
+            _ = c.close(fd);
+            return null;
+        }
+        _ = c.usleep(20_000);
+        waited += 20;
+    }
+    return fd;
+}
+
+fn lockControlPlane() c_int {
+    return tryLockControlPlane() orelse
+        fatal("{s} held for over {d}ms -- is another ringzero running?", .{ lock_path, lock_wait_ms });
+}
+
+fn unlockControlPlane(fd: c_int) void {
+    if (fd < 0) return;
+    _ = c.flock(fd, c.LOCK_UN);
+    _ = c.close(fd);
+}
+
 fn pinnedFd(pindir: []const u8, name: []const u8) c_int {
     var buf: [512]u8 = undefined;
     const path = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ pindir, name }) catch fatal("path too long", .{});
@@ -411,6 +456,9 @@ fn cmdVipAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     const proto_str = flags.getReq("--proto");
     const proto = parseProto(proto_str) catch fatal("invalid --proto: {s} (expected tcp or udp)", .{proto_str});
 
+    const lock = lockControlPlane();
+    defer unlockControlPlane(lock);
+
     const maps = Maps.open(pindir);
     defer maps.close();
 
@@ -449,6 +497,9 @@ fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     const egress_iface = flags.getReq("--iface");
     const ifindex = ifNameToIndex(egress_iface) catch fatal("no such interface: {s}", .{egress_iface});
 
+    const lock = lockControlPlane();
+    defer unlockControlPlane(lock);
+
     const maps = Maps.open(pindir);
     defer maps.close();
 
@@ -471,11 +522,14 @@ fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     be.proto = vip_spec.proto;
     be.flags = c.BACKEND_FLAG_HEALTHY;
 
-    if (c.bpf_map_update_elem(maps.backend, &backend_id, &be, c.BPF_ANY) != 0)
-        fatal("backend_map update failed", .{});
+    // NOEXIST, not ANY: nextFreeBackendId only observed the slot was free, it
+    // didn't reserve it.
+    if (c.bpf_map_update_elem(maps.backend, &backend_id, &be, c.BPF_NOEXIST) != 0)
+        fatal("backend_map update failed: id {d} was taken concurrently", .{backend_id});
 
     vinfo.backend_count += 1;
-    _ = c.bpf_map_update_elem(maps.vip, &vkey, &vinfo, c.BPF_EXIST);
+    if (c.bpf_map_update_elem(maps.vip, &vkey, &vinfo, c.BPF_EXIST) != 0)
+        fatal("vip_map update failed while bumping backend_count", .{});
 
     info("added backend_id {d}: {s} (mac {s}) via {s} for vip_id {d}", .{
         backend_id, addr_str, mac_str, egress_iface, vinfo.vip_id,
@@ -491,6 +545,9 @@ fn cmdBackendSet(allocator: std.mem.Allocator, flags: Flags) !void {
     const up = flags.has("--up");
     const down = flags.has("--down");
     if (up == down) fatal("specify exactly one of --up / --down", .{});
+
+    const lock = lockControlPlane();
+    defer unlockControlPlane(lock);
 
     const maps = Maps.open(pindir);
     defer maps.close();
