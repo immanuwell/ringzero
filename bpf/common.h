@@ -4,8 +4,8 @@
  * so this single header can be parsed both by clang -target bpf and by Zig's
  * @cImport with identical struct layout on both sides.
  */
-#ifndef PROXY_COMMON_H
-#define PROXY_COMMON_H
+#ifndef RINGZERO_COMMON_H
+#define RINGZERO_COMMON_H
 
 /* Deliberately not unconditionally including <stdint.h>: pulling in glibc
  * headers while compiling for -target bpf drags in multilib stub checks
@@ -82,4 +82,4 @@ struct lb_stats {
  * — every slot must be explicitly written, and this is the "empty" value. */
 #define BACKEND_ID_NONE 0xFFFFFFFFu
 
-#endif /* PROXY_COMMON_H */
+#endif /* RINGZERO_COMMON_H */

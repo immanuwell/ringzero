@@ -14,6 +14,9 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
 
 .PHONY: all bpf zig bench clean vmlinux
 
+# A failed bpftool still leaves the shell-created, empty vmlinux.h behind.
+.DELETE_ON_ERROR:
+
 all: bpf zig bench
 
 $(VMLINUX_H):
