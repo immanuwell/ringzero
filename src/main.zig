@@ -338,18 +338,15 @@ fn cmdAttach(flags: Flags) !void {
     const prog_fd = c.bpf_program__fd(prog);
     if (prog_fd < 0) fatal("bpf_program__fd failed", .{});
 
-    mkdirIfMissing(pindir);
-    var pin_buf: [512]u8 = undefined;
-    const pin_z = try std.fmt.bufPrintZ(&pin_buf, "{s}", .{pindir});
-    const pin_ret = c.bpf_object__pin_maps(obj, pin_z.ptr);
-    if (pin_ret != 0) fatal("bpf_object__pin_maps({s}) failed: {d} (maps already pinned from a previous attach? try `detach --purge` first)", .{ pindir, pin_ret });
-
     const ifindex = try ifNameToIndex(iface);
 
     const drv_flags: u32 = c.XDP_FLAGS_UPDATE_IF_NOEXIST | c.XDP_FLAGS_DRV_MODE;
     const skb_flags: u32 = c.XDP_FLAGS_UPDATE_IF_NOEXIST | c.XDP_FLAGS_SKB_MODE;
 
+    // Attach before pinning, so a failed attach doesn't leave pins behind for
+    // the next run to trip over.
     var used_mode: []const u8 = "native (driver, XDP_FLAGS_DRV_MODE)";
+    var used_flags: u32 = drv_flags;
     var ret: c_int = -1;
     if (std.mem.eql(u8, mode, "native") or std.mem.eql(u8, mode, "auto")) {
         ret = c.bpf_xdp_attach(@intCast(ifindex), prog_fd, drv_flags, null);
@@ -357,8 +354,20 @@ fn cmdAttach(flags: Flags) !void {
     if (ret != 0 and (std.mem.eql(u8, mode, "generic") or std.mem.eql(u8, mode, "auto"))) {
         ret = c.bpf_xdp_attach(@intCast(ifindex), prog_fd, skb_flags, null);
         used_mode = "generic (SKB, XDP_FLAGS_SKB_MODE)";
+        used_flags = skb_flags;
     }
     if (ret != 0) fatal("bpf_xdp_attach on {s} (ifindex {d}) failed: {d}. Native XDP needs NIC driver support; try --mode generic.", .{ iface, ifindex, ret });
+
+    mkdirIfMissing(pindir);
+    var pin_buf: [512]u8 = undefined;
+    const pin_z = try std.fmt.bufPrintZ(&pin_buf, "{s}", .{pindir});
+    const pin_ret = c.bpf_object__pin_maps(obj, pin_z.ptr);
+    if (pin_ret != 0) {
+        // Unpinned maps mean no later command can find the program, so back
+        // the attach out rather than leave a data plane nobody can configure.
+        _ = c.bpf_xdp_detach(@intCast(ifindex), used_flags, null);
+        fatal("bpf_object__pin_maps({s}) failed: {d} (maps already pinned from a previous attach? try `detach --purge` first)", .{ pindir, pin_ret });
+    }
 
     info(
         \\attached xdp_lb_prog to {s} (ifindex {d}) in {s} mode
