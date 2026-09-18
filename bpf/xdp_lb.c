@@ -137,8 +137,10 @@ int xdp_lb_prog(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
 
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
+    if ((void *)(eth + 1) > data_end) {
+        bump_passed();
         return XDP_PASS;
+    }
 
     if (eth->h_proto != bpf_htons(ETH_P_IP)) {
         bump_passed();
@@ -146,10 +148,14 @@ int xdp_lb_prog(struct xdp_md *ctx)
     }
 
     struct iphdr *iph = (void *)(eth + 1);
-    if ((void *)(iph + 1) > data_end)
+    if ((void *)(iph + 1) > data_end) {
+        bump_passed();
         return XDP_PASS;
-    if (iph->ihl < 5)
+    }
+    if (iph->ihl < 5) {
+        bump_stats(STATS_GLOBAL_IDX, 0, 1);
         return XDP_DROP;
+    }
 
     /* Only the first fragment carries L4 ports, and sending it to a backend
      * while the rest goes to the kernel just strands both halves. Leave the
@@ -159,10 +165,12 @@ int xdp_lb_prog(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    /* We don't support IP options in the fast path — bail to the kernel. */
+    /* IP options are fine; ihl just moves where L4 starts. */
     void *l4 = (void *)iph + (iph->ihl * 4);
-    if (l4 > data_end)
+    if (l4 > data_end) {
+        bump_passed();
         return XDP_PASS;
+    }
 
     __u16 sport = 0, dport = 0;
     struct tcphdr *tcph = NULL;
@@ -170,14 +178,18 @@ int xdp_lb_prog(struct xdp_md *ctx)
 
     if (iph->protocol == IPPROTO_TCP_) {
         tcph = l4;
-        if ((void *)(tcph + 1) > data_end)
+        if ((void *)(tcph + 1) > data_end) {
+            bump_passed();
             return XDP_PASS;
+        }
         sport = tcph->source;
         dport = tcph->dest;
     } else if (iph->protocol == IPPROTO_UDP_) {
         udph = l4;
-        if ((void *)(udph + 1) > data_end)
+        if ((void *)(udph + 1) > data_end) {
+            bump_passed();
             return XDP_PASS;
+        }
         sport = udph->source;
         dport = udph->dest;
     } else {
@@ -208,12 +220,14 @@ int xdp_lb_prog(struct xdp_md *ctx)
     __u32 *backend_id = bpf_map_lookup_elem(&maglev_map, &mkey);
     if (!backend_id || *backend_id == BACKEND_ID_NONE) {
         bump_stats(vip->vip_id + 1, 0, 1);
+        bump_stats(STATS_GLOBAL_IDX, 0, 1);
         return XDP_DROP;
     }
 
     struct backend *be = bpf_map_lookup_elem(&backend_map, backend_id);
     if (!be || !(be->flags & BACKEND_FLAG_HEALTHY)) {
         bump_stats(vip->vip_id + 1, 0, 1);
+        bump_stats(STATS_GLOBAL_IDX, 0, 1);
         return XDP_DROP;
     }
 
