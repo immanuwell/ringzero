@@ -18,7 +18,7 @@ flowchart LR
     end
 
     subgraph USERSPACE["Userspace control plane"]
-        CLI["ringzero CLI<br/>attach · vip-add · backend-add<br/>backend-set · healthcheck · stats"]
+        CLI["ringzero CLI<br/>attach · stats<br/>vip-add · vip-del<br/>backend-add<br/>backend-set<br/>backend-del<br/>healthcheck"]
     end
 
     Backend1(["Backend"])
