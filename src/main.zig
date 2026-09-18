@@ -402,9 +402,10 @@ fn cmdDetach(flags: Flags) !void {
     }
 }
 
-fn cmdVipAdd(flags: Flags) !void {
+fn cmdVipAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     const pindir = flags.getDefault("--pindir", default_pindir);
-    const addr = try parseIp(flags.getReq("--vip"));
+    const vip_str = flags.getReq("--vip");
+    const addr = try parseIp(vip_str);
     const port_num = try std.fmt.parseInt(u16, flags.getReq("--port"), 10);
     const proto = try parseProto(flags.getReq("--proto"));
 
@@ -421,10 +422,16 @@ fn cmdVipAdd(flags: Flags) !void {
     vinfo.vip_id = vip_id;
     vinfo.backend_count = 0;
 
+    // Blank the slice before the VIP is reachable: an ARRAY map reads back as
+    // zeros, and 0 is a valid backend id. Publishing the row first leaves a
+    // window where traffic matches the VIP and reads whatever the previous
+    // holder of this id left behind.
+    try rebuildMaglev(allocator, maps, vip_id);
+
     if (c.bpf_map_update_elem(maps.vip, &key, &vinfo, c.BPF_NOEXIST) != 0)
         fatal("vip already exists (or vip_map update failed)", .{});
 
-    info("added vip {s}:{d}/{s} -> vip_id {d}", .{ flags.getReq("--vip"), port_num, protoName(proto), vip_id });
+    info("added vip {s}:{d}/{s} -> vip_id {d}", .{ vip_str, port_num, protoName(proto), vip_id });
 }
 
 fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
@@ -704,7 +711,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "detach")) {
         try cmdDetach(flags);
     } else if (std.mem.eql(u8, cmd, "vip-add")) {
-        try cmdVipAdd(flags);
+        try cmdVipAdd(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "backend-add")) {
         try cmdBackendAdd(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "backend-set")) {
