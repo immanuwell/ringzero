@@ -653,6 +653,27 @@ fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
         info("packets={d:>12} bytes={d:>14} dropped={d:>10} passed={d:>10}  |  {d:>12.0} pps  {d:>10.2} Mbps", .{
             cur.packets, cur.bytes, cur.dropped, cur.passed, pps, bps * 8.0 / 1_000_000.0,
         });
+
+        // The data plane keeps these per-VIP counters on every packet, so
+        // there is no reason not to show them.
+        var vkey: c.struct_vip_key = undefined;
+        var vnext: c.struct_vip_key = undefined;
+        var have_vkey = false;
+        while (true) {
+            const key_ptr: ?*c.struct_vip_key = if (have_vkey) &vkey else null;
+            if (c.bpf_map_get_next_key(maps.vip, key_ptr, &vnext) != 0) break;
+            vkey = vnext;
+            have_vkey = true;
+            var vinfo: c.struct_vip_info = undefined;
+            if (c.bpf_map_lookup_elem(maps.vip, &vkey, &vinfo) != 0) continue;
+            const vs = try readStatsSummed(maps.stats, vinfo.vip_id + 1, ncpu, allocator);
+            var ipbuf: [16]u8 = undefined;
+            const ipstr = try ipToStr(&ipbuf, vkey.vip_addr);
+            info("  {s}:{d}/{s}  packets={d:>12} bytes={d:>14} dropped={d:>10}", .{
+                ipstr,      std.mem.bigToNative(u16, vkey.vip_port), protoName(vkey.proto),
+                vs.packets, vs.bytes,                                vs.dropped,
+            });
+        }
         prev = cur;
         first = false;
         if (!watch) break;
