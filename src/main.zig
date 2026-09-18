@@ -338,7 +338,7 @@ fn cmdAttach(flags: Flags) !void {
     const prog_fd = c.bpf_program__fd(prog);
     if (prog_fd < 0) fatal("bpf_program__fd failed", .{});
 
-    const ifindex = try ifNameToIndex(iface);
+    const ifindex = ifNameToIndex(iface) catch fatal("no such interface: {s}", .{iface});
 
     const drv_flags: u32 = c.XDP_FLAGS_UPDATE_IF_NOEXIST | c.XDP_FLAGS_DRV_MODE;
     const skb_flags: u32 = c.XDP_FLAGS_UPDATE_IF_NOEXIST | c.XDP_FLAGS_SKB_MODE;
@@ -378,7 +378,7 @@ fn cmdAttach(flags: Flags) !void {
 fn cmdDetach(flags: Flags) !void {
     const iface = flags.getReq("--iface");
     const pindir = flags.getDefault("--pindir", default_pindir);
-    const ifindex = try ifNameToIndex(iface);
+    const ifindex = ifNameToIndex(iface) catch fatal("no such interface: {s}", .{iface});
 
     // bpf_xdp_detach(flags=0) doesn't reliably auto-detect which mode is
     // currently attached on every kernel/libbpf combination -- query first
@@ -405,9 +405,11 @@ fn cmdDetach(flags: Flags) !void {
 fn cmdVipAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     const pindir = flags.getDefault("--pindir", default_pindir);
     const vip_str = flags.getReq("--vip");
-    const addr = try parseIp(vip_str);
-    const port_num = try std.fmt.parseInt(u16, flags.getReq("--port"), 10);
-    const proto = try parseProto(flags.getReq("--proto"));
+    const addr = parseIp(vip_str) catch fatal("invalid --vip address: {s}", .{vip_str});
+    const port_str = flags.getReq("--port");
+    const port_num = std.fmt.parseInt(u16, port_str, 10) catch fatal("invalid --port: {s} (expected 0-65535, 0 for any port)", .{port_str});
+    const proto_str = flags.getReq("--proto");
+    const proto = parseProto(proto_str) catch fatal("invalid --proto: {s} (expected tcp or udp)", .{proto_str});
 
     const maps = Maps.open(pindir);
     defer maps.close();
@@ -436,12 +438,16 @@ fn cmdVipAdd(allocator: std.mem.Allocator, flags: Flags) !void {
 
 fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     const pindir = flags.getDefault("--pindir", default_pindir);
-    const vip_spec = try parseVipSpec(flags.getReq("--vip"));
-    const addr = try parseIp(flags.getReq("--addr"));
-    const mac = try parseMac(flags.getReq("--mac"));
-    const router_mac = try parseMac(flags.getReq("--router-mac"));
+    const spec_str = flags.getReq("--vip");
+    const vip_spec = parseVipSpec(spec_str) catch fatal("invalid --vip: {s} (expected IP:PORT/tcp|udp)", .{spec_str});
+    const addr_str = flags.getReq("--addr");
+    const addr = parseIp(addr_str) catch fatal("invalid --addr: {s}", .{addr_str});
+    const mac_str = flags.getReq("--mac");
+    const mac = parseMac(mac_str) catch fatal("invalid --mac: {s}", .{mac_str});
+    const rmac_str = flags.getReq("--router-mac");
+    const router_mac = parseMac(rmac_str) catch fatal("invalid --router-mac: {s}", .{rmac_str});
     const egress_iface = flags.getReq("--iface");
-    const ifindex = try ifNameToIndex(egress_iface);
+    const ifindex = ifNameToIndex(egress_iface) catch fatal("no such interface: {s}", .{egress_iface});
 
     const maps = Maps.open(pindir);
     defer maps.close();
@@ -472,7 +478,7 @@ fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     _ = c.bpf_map_update_elem(maps.vip, &vkey, &vinfo, c.BPF_EXIST);
 
     info("added backend_id {d}: {s} (mac {s}) via {s} for vip_id {d}", .{
-        backend_id, flags.getReq("--addr"), flags.getReq("--mac"), egress_iface, vinfo.vip_id,
+        backend_id, addr_str, mac_str, egress_iface, vinfo.vip_id,
     });
 
     try rebuildMaglev(allocator, maps, vinfo.vip_id);
@@ -480,7 +486,8 @@ fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
 
 fn cmdBackendSet(allocator: std.mem.Allocator, flags: Flags) !void {
     const pindir = flags.getDefault("--pindir", default_pindir);
-    const id = try std.fmt.parseInt(u32, flags.getReq("--id"), 10);
+    const id_str = flags.getReq("--id");
+    const id = std.fmt.parseInt(u32, id_str, 10) catch fatal("invalid --id: {s}", .{id_str});
     const up = flags.has("--up");
     const down = flags.has("--down");
     if (up == down) fatal("specify exactly one of --up / --down", .{});
