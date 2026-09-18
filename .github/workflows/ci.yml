@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev libelf-dev \
+              linux-tools-common linux-tools-generic
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The bpftool on PATH is a wrapper that dispatches to a binary matching
+      # the running kernel, which runners do not ship. The one from
+      # linux-tools-generic is a different version, but `btf dump file` reads a
+      # file, so the mismatch does not matter. sudo resets PATH, so this is an
+      # absolute path rather than a PATH entry.
+      - name: Locate bpftool
+        run: |
+          BPFTOOL=$(ls -d /usr/lib/linux-tools/*/ | tail -1)bpftool
+          test -x "$BPFTOOL"
+          echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
+
+      - name: Build BPF
+        run: make bpf BPFTOOL="$BPFTOOL"
+
+      - name: Build control plane
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build the traffic generator
+        run: make bench
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Check formatting
+        run: zig fmt --check src/ build.zig
+
+      # Loading XDP and creating netns both need privileges the runner has,
+      # but attaching in native mode to veth does not work on every runner
+      # kernel, so this only covers load + map plumbing.
+      - name: Load and configure
+        run: |
+          sudo ./zig-out/bin/ringzero attach --iface lo --mode generic
+          sudo ./zig-out/bin/ringzero vip-add --vip 10.99.0.1 --port 9000 --proto udp
+          sudo ./zig-out/bin/ringzero backend-add --vip 10.99.0.1:9000/udp \
+              --addr 10.20.0.2 --mac aa:bb:cc:dd:ee:01 \
+              --router-mac aa:bb:cc:dd:ee:ff --iface lo
+          sudo ./zig-out/bin/ringzero vip-add --vip 10.99.0.3 --port 80 --proto tcp
+          sudo ./zig-out/bin/ringzero backend-add --vip 10.99.0.3:80/tcp \
+              --addr 10.20.0.3 --mac aa:bb:cc:dd:ee:03 \
+              --router-mac aa:bb:cc:dd:ee:ff --iface lo
+          sudo ./zig-out/bin/ringzero list
+          sudo ./zig-out/bin/ringzero backend-del --id 0
+          sudo ./zig-out/bin/ringzero vip-del --vip 10.99.0.1 --port 9000 --proto udp
+          sudo ./zig-out/bin/ringzero detach --iface lo --purge
+
+      - name: Data plane behaviour
+        run: |
+          sudo ./zig-out/bin/ringzero attach --iface lo --mode generic
+          sudo ./zig-out/bin/ringzero vip-add --vip 10.99.0.1 --port 9000 --proto udp
+          sudo ./zig-out/bin/ringzero vip-add --vip 10.99.0.2 --port 9000 --proto udp
+          sudo ./zig-out/bin/ringzero backend-add --vip 10.99.0.1:9000/udp \
+              --addr 10.20.0.2 --mac aa:bb:cc:dd:ee:01 \
+              --router-mac aa:bb:cc:dd:ee:ff --iface lo
+          # By attachment, not by name: more than one copy of the program
+          # can be loaded, and only one owns the pinned maps.
+          PROG=$(sudo "$BPFTOOL" -j net show | \
+              python3 -c 'import json,sys; print([x["id"] for x in json.load(sys.stdin)[0]["xdp"] if x["devname"] == "lo"][0])')
+          # A VIP with no backends must drop, not fall through to backend id 0.
+          sudo env BPFTOOL="$BPFTOOL" ./scripts/verify_datapath.py --prog-id "$PROG" --vip 10.99.0.2 \
+              --vip-port 9000 --expect-action drop
+          sudo env BPFTOOL="$BPFTOOL" ./scripts/verify_datapath.py --prog-id "$PROG" --vip 10.99.0.1 \
+              --vip-port 9000 --flows 50
+          # --flows checks actions and stability but not the rewrite, so
+          # one single-packet run covers the checksum arithmetic.
+          sudo env BPFTOOL="$BPFTOOL" ./scripts/verify_datapath.py --prog-id "$PROG" --vip 10.99.0.1 \
+              --vip-port 9000 --expect-dst 10.20.0.2
+          sudo env BPFTOOL="$BPFTOOL" ./scripts/verify_datapath.py --prog-id "$PROG" --vip 10.99.0.3 \
+              --vip-port 80 --proto tcp --expect-dst 10.20.0.3
+          sudo ./zig-out/bin/ringzero detach --iface lo --purge
