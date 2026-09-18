@@ -118,9 +118,13 @@ int main(int argc, char **argv) {
     alarm((unsigned)duration);
 
     pthread_t *tids = calloc((size_t)nthreads, sizeof(pthread_t));
+    if (!tids) { perror("calloc"); return 1; }
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (long i = 0; i < nthreads; i++) pthread_create(&tids[i], NULL, worker, &arg);
+    for (long i = 0; i < nthreads; i++) {
+        int err = pthread_create(&tids[i], NULL, worker, &arg);
+        if (err) { fprintf(stderr, "pthread_create: %s\n", strerror(err)); return 1; }
+    }
     for (long i = 0; i < nthreads; i++) pthread_join(tids[i], NULL);
     clock_gettime(CLOCK_MONOTONIC, &t1);
 

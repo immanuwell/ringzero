@@ -21,6 +21,27 @@
 # single-box, all-veth setup versus real multi-queue hardware.
 set -euo pipefail
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+[ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+for t in ip ethtool python3; do
+    command -v "$t" >/dev/null || { echo "$t is required" >&2; exit 1; }
+done
+for f in "$here/zig-out/bin/ringzero" "$here/bpf/xdp_lb.o" "$here/bpf/xdp_pass.o"; do
+    [ -f "$f" ] || { echo "missing $f -- run 'make' first" >&2; exit 1; }
+done
+
+# Any failure past this point leaves half a topology behind, which makes the
+# next run fail on "netns already exists" rather than on the real problem.
+cleanup_on_error() {
+    echo "== setup failed, tearing down ==" >&2
+    "$here/scripts/teardown-netns.sh" >/dev/null 2>&1 || true
+}
+trap cleanup_on_error ERR
+
+# Clear anything a previous run left, so this is re-runnable.
+"$here/scripts/teardown-netns.sh" >/dev/null 2>&1 || true
+
 VIP=10.99.0.1
 VIP_PORT=9000
 
@@ -30,8 +51,6 @@ BACKEND1_IP=10.20.0.2/24
 ROUTER_BACKEND1_IP=10.20.0.1/24
 BACKEND2_IP=10.30.0.2/24
 ROUTER_BACKEND2_IP=10.30.0.1/24
-
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "== creating namespaces =="
 ip netns add client
@@ -69,12 +88,22 @@ ip netns exec backend1 ip addr add "$BACKEND1_IP" dev veth-b1-peer
 ip netns exec backend1 ip link set veth-b1-peer up
 ip netns exec backend1 ip link set lo up
 ip netns exec backend1 ethtool -K veth-b1-peer tx off rx off gro off gso off 2>/dev/null || true
+# DSR: the backend sees the client's original source IP on a link with no
+# route back to it, so the reverse path check drops every packet. The
+# effective value is max(all, per-device), so both have to go.
+ip netns exec backend1 sysctl -qw net.ipv4.conf.all.rp_filter=0
+ip netns exec backend1 sysctl -qw net.ipv4.conf.veth-b1-peer.rp_filter=0
 ethtool -K veth-b1 tx off rx off gro off gso off 2>/dev/null || true
 
 ip netns exec backend2 ip addr add "$BACKEND2_IP" dev veth-b2-peer
 ip netns exec backend2 ip link set veth-b2-peer up
 ip netns exec backend2 ip link set lo up
 ip netns exec backend2 ethtool -K veth-b2-peer tx off rx off gro off gso off 2>/dev/null || true
+# DSR: the backend sees the client's original source IP on a link with no
+# route back to it, so the reverse path check drops every packet. The
+# effective value is max(all, per-device), so both have to go.
+ip netns exec backend2 sysctl -qw net.ipv4.conf.all.rp_filter=0
+ip netns exec backend2 sysctl -qw net.ipv4.conf.veth-b2-peer.rp_filter=0
 ethtool -K veth-b2 tx off rx off gro off gso off 2>/dev/null || true
 
 echo "== enabling native XDP redirect targets on backend peers =="
@@ -89,16 +118,11 @@ ROUTER_MAC=$(cat /sys/class/net/veth-c/address)
 ip netns exec client ip route add "$VIP/32" dev veth-c-peer
 ip netns exec client ip neigh replace "$VIP" lladdr "$ROUTER_MAC" dev veth-c-peer nud permanent
 
-# Optional: a UDP packet counter in each backend netns, purely so you can
-# watch *something* receiving traffic while poking at the demo by hand. Note
-# that end-to-end delivery through nested network namespaces on a given
-# kernel/host can be sensitive to local networking config (conntrack, GRO,
-# sysctls) in ways that have nothing to do with the LB itself -- if these
-# logs stay at 0 while `ringzero stats` is climbing, don't read that as "the
-# eBPF program is broken": use `scripts/verify_datapath.py` (see README) to
-# check the program's packet rewriting in isolation via BPF_PROG_TEST_RUN,
-# which sidesteps the rest of the network stack entirely.
-echo "== starting UDP sink listeners on backends (best-effort, see note in script) =="
+# A UDP packet counter in each backend netns, so you can watch traffic
+# actually arrive. If these stay at 0 while `ringzero stats` climbs, check
+# rp_filter first (see README), and use scripts/verify_datapath.py to test the
+# rewriting in isolation.
+echo "== starting UDP sink listeners on backends =="
 ip netns exec backend1 python3 -u "$here/scripts/udp_sink.py" "${BACKEND1_IP%/*}" "$VIP_PORT" \
     > /tmp/ringzero-backend1.log 2>&1 &
 echo $! > /tmp/ringzero-backend1.pid
@@ -122,6 +146,7 @@ B2_ROUTER_MAC=$(cat /sys/class/net/veth-b2/address)
 "$here/zig-out/bin/ringzero" backend-add --vip "$VIP:$VIP_PORT/udp" \
     --addr "${BACKEND2_IP%/*}" --mac "$B2_MAC" --router-mac "$B2_ROUTER_MAC" --iface veth-b2
 
+trap - ERR
 echo "== done =="
 "$here/zig-out/bin/ringzero" list
 echo

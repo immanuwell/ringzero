@@ -6,7 +6,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 for f in /tmp/ringzero-backend1.pid /tmp/ringzero-backend2.pid; do
     if [ -f "$f" ]; then
-        kill "$(cat "$f")" 2>/dev/null
+        pid=$(cat "$f")
+        # Only if it is still the sink: pids get reused.
+        if grep -qa udp_sink.py "/proc/$pid/cmdline" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+        fi
         rm -f "$f"
     fi
 done
