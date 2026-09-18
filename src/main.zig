@@ -13,6 +13,12 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const maglev = @import("maglev.zig");
 
+comptime {
+    // maglev.build keeps per-backend state in fixed-size stack arrays, and its
+    // own bounds assert is compiled out in ReleaseFast. Fail the build instead.
+    std.debug.assert(c.MAX_BACKENDS <= maglev.max_backends);
+}
+
 const default_pindir = "/sys/fs/bpf/ringzero";
 const default_obj = "bpf/xdp_lb.o";
 const prog_name = "xdp_lb_prog";
@@ -134,6 +140,11 @@ test "parseVipSpec" {
     try std.testing.expectError(error.InvalidVipSpec, parseVipSpec("10.0.0.1:8080"));
     try std.testing.expectError(error.InvalidVipSpec, parseVipSpec("10.0.0.1/udp"));
     try std.testing.expectError(error.InvalidProto, parseVipSpec("10.0.0.1:80/sctp"));
+}
+
+test "maglev sentinel matches the BPF one" {
+    try std.testing.expectEqual(@as(u32, c.BACKEND_ID_NONE), maglev.none);
+    try std.testing.expect(c.MAX_BACKENDS <= maglev.max_backends);
 }
 
 // ---------------------------------------------------------------------------
@@ -282,17 +293,26 @@ fn rebuildMaglev(allocator: std.mem.Allocator, maps: Maps, vip_id: u32) !void {
         try ids.append(allocator, key);
     }
 
-    const table = try allocator.alloc(i64, c.MAGLEV_TABLE_SIZE);
-    defer allocator.free(table);
-    try maglev.build(allocator, ids.items, c.MAGLEV_TABLE_SIZE, table);
+    if (ids.items.len > maglev.max_backends)
+        fatal("vip_id {d} has {d} backends, more than maglev handles", .{ vip_id, ids.items.len });
 
-    var slot: u32 = 0;
-    while (slot < c.MAGLEV_TABLE_SIZE) : (slot += 1) {
-        const mkey = vip_id * c.MAGLEV_TABLE_SIZE + slot;
-        const val: u32 = if (table[slot] < 0) c.BACKEND_ID_NONE else @intCast(table[slot]);
-        if (c.bpf_map_update_elem(maps.maglev, &mkey, &val, c.BPF_ANY) != 0)
-            fatal("failed writing maglev_map[{d}]", .{mkey});
-    }
+    // get_next_key walks the hash map in bucket order. Maglev fills slots in
+    // input order, so sort to keep the table a function of the backend set.
+    std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
+
+    const table = try allocator.alloc(u32, c.MAGLEV_TABLE_SIZE);
+    defer allocator.free(table);
+    maglev.build(ids.items, table);
+
+    // One batch syscall instead of MAGLEV_TABLE_SIZE of them, which also
+    // narrows the window where the data plane sees a half-updated table.
+    const keys = try allocator.alloc(u32, c.MAGLEV_TABLE_SIZE);
+    defer allocator.free(keys);
+    for (keys, 0..) |*k, i| k.* = vip_id * c.MAGLEV_TABLE_SIZE + @as(u32, @intCast(i));
+
+    var count: u32 = c.MAGLEV_TABLE_SIZE;
+    if (c.bpf_map_update_batch(maps.maglev, keys.ptr, table.ptr, &count, null) != 0 or count != c.MAGLEV_TABLE_SIZE)
+        fatal("maglev_map batch update wrote {d}/{d} slots for vip_id {d}; the table is now a mix of two", .{ count, c.MAGLEV_TABLE_SIZE, vip_id });
     info("rebuilt maglev table for vip_id={d}: {d} healthy backend(s)", .{ vip_id, ids.items.len });
 }
 

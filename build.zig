@@ -27,6 +27,21 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+
+    // maglev.zig imports nothing but std, so it gets its own target. Whether
+    // an imported file's tests are collected depends on how the root module
+    // happens to reference it; this way they run regardless, and on a machine
+    // without libbpf.
+    const maglev_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/maglev.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_maglev_tests = b.addRunArtifact(maglev_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_maglev_tests.step);
 }
