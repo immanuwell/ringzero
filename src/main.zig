@@ -561,7 +561,9 @@ fn readStatsSummed(fd: c_int, idx: u32, ncpu: usize, allocator: std.mem.Allocato
 fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
     const pindir = flags.getDefault("--pindir", default_pindir);
     const watch = flags.has("--watch");
-    const interval_s = try std.fmt.parseFloat(f64, flags.getDefault("--interval", "1.0"));
+    const interval_s = std.fmt.parseFloat(f64, flags.getDefault("--interval", "1.0")) catch fatal("invalid --interval", .{});
+    // Negative reaches @intFromFloat on an unsigned type; 0 spins.
+    if (!(interval_s > 0) or interval_s > 3600) fatal("--interval must be between 0 and 3600 seconds", .{});
 
     const maps = Maps.open(pindir);
     defer maps.close();
@@ -570,12 +572,20 @@ fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
 
     var prev = std.mem.zeroes(c.struct_lb_stats);
     var first = true;
+    var last_tick = std.Io.Clock.awake.now(io);
     while (true) {
         const cur = try readStatsSummed(maps.stats, c.STATS_GLOBAL_IDX, ncpu, allocator);
-        const dp = if (first) 0 else cur.packets - prev.packets;
-        const db = if (first) 0 else cur.bytes - prev.bytes;
-        const pps = @as(f64, @floatFromInt(dp)) / interval_s;
-        const bps = @as(f64, @floatFromInt(db)) / interval_s;
+        // Saturating: a re-attach resets the counters, and cur < prev would
+        // otherwise wrap into nonsense or trap.
+        const dp = if (first) 0 else cur.packets -| prev.packets;
+        const db = if (first) 0 else cur.bytes -| prev.bytes;
+        // Rate over the time that actually passed, not the requested interval.
+        const tick = std.Io.Clock.awake.now(io);
+        const elapsed_s = @as(f64, @floatFromInt(last_tick.durationTo(tick).nanoseconds)) / 1_000_000_000.0;
+        last_tick = tick;
+        const per_s = if (first or elapsed_s <= 0) 0 else 1.0 / elapsed_s;
+        const pps = @as(f64, @floatFromInt(dp)) * per_s;
+        const bps = @as(f64, @floatFromInt(db)) * per_s;
         info("packets={d:>12} bytes={d:>14} dropped={d:>10} passed={d:>10}  |  {d:>12.0} pps  {d:>10.2} Mbps", .{
             cur.packets, cur.bytes, cur.dropped, cur.passed, pps, bps * 8.0 / 1_000_000.0,
         });
