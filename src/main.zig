@@ -285,11 +285,46 @@ fn nextFreeBackendId(fd: c_int) !u32 {
     var id: u32 = 0;
     while (id < c.MAX_BACKENDS) : (id += 1) {
         var tmp: c.struct_backend = undefined;
-        const ret = c.bpf_map_lookup_elem(fd, &id, &tmp);
-        if (ret != 0) return id; // ENOENT => free
+        if (c.bpf_map_lookup_elem(fd, &id, &tmp) != 0) return id; // ENOENT => free
     }
     return error.NoFreeBackendSlots;
 }
+
+fn clearBackend(fd: c_int, id: u32) bool {
+    var key = id;
+    return c.bpf_map_delete_elem(fd, &key) == 0;
+}
+
+/// Reads backend `id`, or null if there is none.
+fn getBackend(fd: c_int, id: u32) ?c.struct_backend {
+    var key = id;
+    var be: c.struct_backend = undefined;
+    if (c.bpf_map_lookup_elem(fd, &key, &be) != 0) return null;
+    return be;
+}
+
+/// Walks backend_map. Wraps the get_next_key dance its callers would
+/// otherwise each repeat.
+const BackendIter = struct {
+    fd: c_int,
+    key: u32 = undefined,
+    have_key: bool = false,
+
+    const Entry = struct { id: u32, be: c.struct_backend };
+
+    fn next(self: *BackendIter) ?Entry {
+        while (true) {
+            var next_key: u32 = undefined;
+            const key_ptr: ?*u32 = if (self.have_key) &self.key else null;
+            if (c.bpf_map_get_next_key(self.fd, key_ptr, &next_key) != 0) return null;
+            self.key = next_key;
+            self.have_key = true;
+            var be: c.struct_backend = undefined;
+            if (c.bpf_map_lookup_elem(self.fd, &self.key, &be) != 0) continue;
+            return .{ .id = self.key, .be = be };
+        }
+    }
+};
 
 /// Finds the first vip_id in [0, MAX_VIPS) not currently used by any entry
 /// in vip_map (scanned via full iteration since the map key is a vip_key,
@@ -315,6 +350,23 @@ fn nextFreeVipId(fd: c_int) !u32 {
     return error.NoFreeVipSlots;
 }
 
+/// vip_map is keyed by the VIP tuple, so reaching a VIP from a backend's
+/// vip_id means scanning.
+fn findVipKeyById(fd: c_int, vip_id: u32) ?c.struct_vip_key {
+    var key: c.struct_vip_key = undefined;
+    var next_key: c.struct_vip_key = undefined;
+    var have_key = false;
+    while (true) {
+        const key_ptr: ?*c.struct_vip_key = if (have_key) &key else null;
+        if (c.bpf_map_get_next_key(fd, key_ptr, &next_key) != 0) return null;
+        key = next_key;
+        have_key = true;
+        var vinfo: c.struct_vip_info = undefined;
+        if (c.bpf_map_lookup_elem(fd, &key, &vinfo) != 0) continue;
+        if (vinfo.vip_id == vip_id) return key;
+    }
+}
+
 /// Recomputes the Maglev table for `vip_id` from every healthy backend
 /// currently assigned to it in backend_map, and pushes the full table (all
 /// MAGLEV_TABLE_SIZE slots, including BACKEND_ID_NONE for unfilled ones) into
@@ -323,19 +375,11 @@ fn rebuildMaglev(allocator: std.mem.Allocator, maps: Maps, vip_id: u32) !void {
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(allocator);
 
-    var key: u32 = undefined;
-    var next_key: u32 = undefined;
-    var have_key = false;
-    while (true) {
-        const key_ptr: ?*u32 = if (have_key) &key else null;
-        if (c.bpf_map_get_next_key(maps.backend, key_ptr, &next_key) != 0) break;
-        key = next_key;
-        have_key = true;
-        var be: c.struct_backend = undefined;
-        if (c.bpf_map_lookup_elem(maps.backend, &key, &be) != 0) continue;
-        if (be.vip_id != vip_id) continue;
-        if (be.flags & c.BACKEND_FLAG_HEALTHY == 0) continue;
-        try ids.append(allocator, key);
+    var it = BackendIter{ .fd = maps.backend };
+    while (it.next()) |e| {
+        if (e.be.vip_id != vip_id) continue;
+        if (e.be.flags & c.BACKEND_FLAG_HEALTHY == 0) continue;
+        try ids.append(allocator, e.id);
     }
 
     if (ids.items.len > maglev.max_backends)
@@ -552,14 +596,87 @@ fn cmdBackendSet(allocator: std.mem.Allocator, flags: Flags) !void {
     const maps = Maps.open(pindir);
     defer maps.close();
 
-    var be: c.struct_backend = undefined;
-    if (c.bpf_map_lookup_elem(maps.backend, &id, &be) != 0) fatal("no such backend id {d}", .{id});
+    var be = getBackend(maps.backend, id) orelse fatal("no such backend id {d}", .{id});
 
     if (up) be.flags |= c.BACKEND_FLAG_HEALTHY else be.flags &= ~@as(u8, c.BACKEND_FLAG_HEALTHY);
     if (c.bpf_map_update_elem(maps.backend, &id, &be, c.BPF_EXIST) != 0) fatal("update failed", .{});
 
     info("backend {d} marked {s}", .{ id, if (up) "UP" else "DOWN" });
     try rebuildMaglev(allocator, maps, be.vip_id);
+}
+
+fn cmdBackendDel(allocator: std.mem.Allocator, flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const id_str = flags.getReq("--id");
+    const id = std.fmt.parseInt(u32, id_str, 10) catch fatal("invalid --id: {s}", .{id_str});
+
+    const lock = lockControlPlane();
+    defer unlockControlPlane(lock);
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    const be = getBackend(maps.backend, id) orelse fatal("no such backend id {d}", .{id});
+    if (!clearBackend(maps.backend, id)) fatal("backend_map delete failed", .{});
+
+    if (findVipKeyById(maps.vip, be.vip_id)) |vkey| {
+        var k = vkey;
+        var vinfo: c.struct_vip_info = undefined;
+        if (c.bpf_map_lookup_elem(maps.vip, &k, &vinfo) == 0 and vinfo.backend_count > 0) {
+            vinfo.backend_count -= 1;
+            _ = c.bpf_map_update_elem(maps.vip, &k, &vinfo, c.BPF_EXIST);
+        }
+    }
+
+    try rebuildMaglev(allocator, maps, be.vip_id);
+    info("removed backend {d}", .{id});
+}
+
+fn cmdVipDel(allocator: std.mem.Allocator, flags: Flags) !void {
+    const pindir = flags.getDefault("--pindir", default_pindir);
+    const vip_str = flags.getReq("--vip");
+    const addr = parseIp(vip_str) catch fatal("invalid --vip address: {s}", .{vip_str});
+    const port_str = flags.getReq("--port");
+    const port_num = std.fmt.parseInt(u16, port_str, 10) catch fatal("invalid --port: {s} (expected 0-65535, 0 for any port)", .{port_str});
+    const proto_str = flags.getReq("--proto");
+    const proto = parseProto(proto_str) catch fatal("invalid --proto: {s} (expected tcp or udp)", .{proto_str});
+
+    const lock = lockControlPlane();
+    defer unlockControlPlane(lock);
+
+    const maps = Maps.open(pindir);
+    defer maps.close();
+
+    var key = std.mem.zeroes(c.struct_vip_key);
+    key.vip_addr = addr;
+    key.vip_port = std.mem.nativeToBig(u16, port_num);
+    key.proto = proto;
+
+    var vinfo: c.struct_vip_info = undefined;
+    if (c.bpf_map_lookup_elem(maps.vip, &key, &vinfo) != 0) fatal("no such vip", .{});
+
+    var removed: u32 = 0;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(allocator);
+    var it = BackendIter{ .fd = maps.backend };
+    while (it.next()) |e| {
+        if (e.be.vip_id == vinfo.vip_id) try ids.append(allocator, e.id);
+    }
+    for (ids.items) |bid| {
+        if (clearBackend(maps.backend, bid)) removed += 1;
+    }
+
+    if (c.bpf_map_delete_elem(maps.vip, &key) != 0) fatal("vip_map delete failed", .{});
+
+    // Blank the slice and the counters before the id is handed out again.
+    try rebuildMaglev(allocator, maps, vinfo.vip_id);
+    var stats_key = vinfo.vip_id + 1;
+    const ncpu: usize = @intCast(c.libbpf_num_possible_cpus());
+    const zeroed = try allocator.alloc(c.struct_lb_stats, ncpu);
+    defer allocator.free(zeroed);
+    @memset(std.mem.sliceAsBytes(zeroed), 0);
+    _ = c.bpf_map_update_elem(maps.stats, &stats_key, zeroed.ptr, c.BPF_ANY);
+    info("removed vip {s}:{d}/{s} (vip_id {d}) and {d} backend(s)", .{ vip_str, port_num, protoName(proto), vinfo.vip_id, removed });
 }
 
 fn cmdList(flags: Flags) !void {
@@ -586,16 +703,10 @@ fn cmdList(flags: Flags) !void {
     }
 
     info("Backends:", .{});
-    var bkey: u32 = undefined;
-    var bnext: u32 = undefined;
-    var have_bkey = false;
-    while (true) {
-        const key_ptr: ?*u32 = if (have_bkey) &bkey else null;
-        if (c.bpf_map_get_next_key(maps.backend, key_ptr, &bnext) != 0) break;
-        bkey = bnext;
-        have_bkey = true;
-        var be: c.struct_backend = undefined;
-        if (c.bpf_map_lookup_elem(maps.backend, &bkey, &be) != 0) continue;
+    var bit = BackendIter{ .fd = maps.backend };
+    while (bit.next()) |e| {
+        const bkey = e.id;
+        const be = e.be;
         var ipbuf: [16]u8 = undefined;
         const ipstr = try ipToStr(&ipbuf, be.addr);
         var macbuf: [18]u8 = undefined;
@@ -774,6 +885,8 @@ fn printUsage() void {
         \\  ringzero vip-add --vip IP --port PORT --proto tcp|udp [--pindir DIR]
         \\  ringzero backend-add --vip IP:PORT/proto --addr IP --mac MAC --router-mac MAC --iface IFACE [--pindir DIR]
         \\  ringzero backend-set --id ID (--up|--down) [--pindir DIR]
+        \\  ringzero backend-del --id ID [--pindir DIR]
+        \\  ringzero vip-del --vip IP --port PORT --proto tcp|udp [--pindir DIR]
         \\  ringzero list [--pindir DIR]
         \\  ringzero stats [--watch] [--interval SEC] [--pindir DIR]
         \\  ringzero healthcheck [--interval SEC] [--timeout-ms MS] [--pindir DIR]
@@ -811,6 +924,10 @@ pub fn main(init: std.process.Init) !void {
         try cmdBackendAdd(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "backend-set")) {
         try cmdBackendSet(allocator, flags);
+    } else if (std.mem.eql(u8, cmd, "backend-del")) {
+        try cmdBackendDel(allocator, flags);
+    } else if (std.mem.eql(u8, cmd, "vip-del")) {
+        try cmdVipDel(allocator, flags);
     } else if (std.mem.eql(u8, cmd, "list")) {
         try cmdList(flags);
     } else if (std.mem.eql(u8, cmd, "stats")) {
