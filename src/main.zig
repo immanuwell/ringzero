@@ -22,44 +22,49 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+/// All set once in main. The writer has to be one long-lived instance:
+/// File.Writer tracks a file position, so a fresh one per line rewrites byte 0
+/// of a redirect and only the last line survives.
+var io: std.Io = undefined;
+var stdout_buf: [4096]u8 = undefined;
+var stdout_file: std.Io.File.Writer = undefined;
+var out: *std.Io.Writer = undefined;
+
+/// Results go to stdout so they can be redirected; std.debug.print (stderr)
+/// stays for errors and diagnostics.
+fn info(comptime fmt: []const u8, args: anytype) void {
+    out.print(fmt ++ "\n", args) catch return;
+    // Per line, because fatal() exits without unwinding.
+    out.flush() catch return;
+}
+
 // ---------------------------------------------------------------------------
 // small parsing helpers
 // ---------------------------------------------------------------------------
 
+/// Returns the address in network byte order, the form the BPF maps store.
 fn parseIp(s: []const u8) !u32 {
-    var buf: [64]u8 = undefined;
-    const z = try std.fmt.bufPrintZ(&buf, "{s}", .{s});
-    var result: u32 = 0;
-    const ret = c.inet_pton(c.AF_INET, z.ptr, @ptrCast(&result));
-    if (ret != 1) return error.InvalidIp;
-    return result;
+    const a = std.Io.net.Ip4Address.parse(s, 0) catch return error.InvalidIp;
+    return @bitCast(a.bytes);
 }
 
-/// `addr_be` holds the four dotted-quad octets in network-byte-order as raw
-/// memory (written by inet_pton), reinterpreted as a native u32. On our
-/// little-endian host that makes the *first* transmitted octet the
-/// *least*-significant byte of the integer -- the reverse of the usual
-/// "network byte order = big endian = MSB first" framing, which is exactly
-/// why the classic footgun is doing the shift the other way around.
+/// The u32 holds the octets in wire order, so its bytes are the dotted quad
+/// on any host.
 fn ipToStr(buf: []u8, addr_be: u32) ![]u8 {
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-        addr_be & 0xff,
-        (addr_be >> 8) & 0xff,
-        (addr_be >> 16) & 0xff,
-        (addr_be >> 24) & 0xff,
-    });
+    const o: [4]u8 = @bitCast(addr_be);
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ o[0], o[1], o[2], o[3] });
 }
 
 fn parseMac(s: []const u8) ![6]u8 {
-    var out: [6]u8 = undefined;
+    var mac: [6]u8 = undefined;
     var it = std.mem.splitScalar(u8, s, ':');
     var i: usize = 0;
     while (it.next()) |part| : (i += 1) {
         if (i >= 6) return error.InvalidMac;
-        out[i] = try std.fmt.parseInt(u8, part, 16);
+        mac[i] = try std.fmt.parseInt(u8, part, 16);
     }
     if (i != 6) return error.InvalidMac;
-    return out;
+    return mac;
 }
 
 fn macToStr(buf: []u8, mac: [6]u8) ![]u8 {
@@ -95,6 +100,40 @@ fn parseVipSpec(s: []const u8) !VipSpec {
     const addr = try parseIp(s[0..colon]);
     const port = try std.fmt.parseInt(u16, s[colon + 1 .. slash], 10);
     return .{ .addr = addr, .port = std.mem.nativeToBig(u16, port), .proto = proto };
+}
+
+test "parseIp round-trips through ipToStr" {
+    var buf: [16]u8 = undefined;
+    for ([_][]const u8{ "0.0.0.0", "10.20.0.2", "192.168.1.255", "255.255.255.255" }) |s| {
+        try std.testing.expectEqualStrings(s, try ipToStr(&buf, try parseIp(s)));
+    }
+    try std.testing.expectError(error.InvalidIp, parseIp("10.0.0"));
+    try std.testing.expectError(error.InvalidIp, parseIp("256.0.0.1"));
+    try std.testing.expectError(error.InvalidIp, parseIp(""));
+}
+
+test "parseIp yields network byte order" {
+    // 1.2.3.4 on the wire is the bytes 01 02 03 04, whichever way the host
+    // orders integers.
+    const octets: [4]u8 = @bitCast(try parseIp("1.2.3.4"));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, &octets);
+}
+
+test "parseMac" {
+    try std.testing.expectEqual([6]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01 }, try parseMac("aa:bb:cc:dd:ee:01"));
+    try std.testing.expectError(error.InvalidMac, parseMac("aa:bb:cc:dd:ee"));
+    try std.testing.expectError(error.InvalidMac, parseMac("aa:bb:cc:dd:ee:01:02"));
+}
+
+test "parseVipSpec" {
+    const v = try parseVipSpec("10.0.0.1:8080/udp");
+    try std.testing.expectEqual(try parseIp("10.0.0.1"), v.addr);
+    try std.testing.expectEqual(@as(u16, 8080), std.mem.bigToNative(u16, v.port));
+    try std.testing.expectEqual(@as(u8, c.IPPROTO_UDP_), v.proto);
+
+    try std.testing.expectError(error.InvalidVipSpec, parseVipSpec("10.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidVipSpec, parseVipSpec("10.0.0.1/udp"));
+    try std.testing.expectError(error.InvalidProto, parseVipSpec("10.0.0.1:80/sctp"));
 }
 
 // ---------------------------------------------------------------------------
@@ -138,8 +177,8 @@ const Flags = struct {
 fn mkdirIfMissing(pindir: []const u8) void {
     var buf: [512]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{pindir}) catch fatal("pindir path too long", .{});
-    if (c.mkdir(z.ptr, 0o755) != 0 and c.__errno_location().* != c.EEXIST)
-        fatal("mkdir({s}) failed: errno {d}", .{ pindir, c.__errno_location().* });
+    if (c.mkdir(z.ptr, 0o755) != 0 and std.c._errno().* != c.EEXIST)
+        fatal("mkdir({s}) failed: errno {d}", .{ pindir, std.c._errno().* });
 }
 
 fn purgePinDir(pindir: []const u8) void {
@@ -209,9 +248,9 @@ fn nextFreeVipId(fd: c_int) !u32 {
         if (c.bpf_map_get_next_key(fd, key_ptr, &next_key) != 0) break;
         key = next_key;
         have_key = true;
-        var info: c.struct_vip_info = undefined;
-        if (c.bpf_map_lookup_elem(fd, &key, &info) == 0) {
-            if (info.vip_id < c.MAX_VIPS) used[info.vip_id] = true;
+        var vinfo: c.struct_vip_info = undefined;
+        if (c.bpf_map_lookup_elem(fd, &key, &vinfo) == 0) {
+            if (vinfo.vip_id < c.MAX_VIPS) used[vinfo.vip_id] = true;
         }
     }
     for (used, 0..) |u, i| {
@@ -225,8 +264,8 @@ fn nextFreeVipId(fd: c_int) !u32 {
 /// MAGLEV_TABLE_SIZE slots, including BACKEND_ID_NONE for unfilled ones) into
 /// maglev_map. This is the only place that writes maglev_map.
 fn rebuildMaglev(allocator: std.mem.Allocator, maps: Maps, vip_id: u32) !void {
-    var ids = std.array_list.Managed(u32).init(allocator);
-    defer ids.deinit();
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(allocator);
 
     var key: u32 = undefined;
     var next_key: u32 = undefined;
@@ -240,7 +279,7 @@ fn rebuildMaglev(allocator: std.mem.Allocator, maps: Maps, vip_id: u32) !void {
         if (c.bpf_map_lookup_elem(maps.backend, &key, &be) != 0) continue;
         if (be.vip_id != vip_id) continue;
         if (be.flags & c.BACKEND_FLAG_HEALTHY == 0) continue;
-        try ids.append(key);
+        try ids.append(allocator, key);
     }
 
     const table = try allocator.alloc(i64, c.MAGLEV_TABLE_SIZE);
@@ -254,7 +293,7 @@ fn rebuildMaglev(allocator: std.mem.Allocator, maps: Maps, vip_id: u32) !void {
         if (c.bpf_map_update_elem(maps.maglev, &mkey, &val, c.BPF_ANY) != 0)
             fatal("failed writing maglev_map[{d}]", .{mkey});
     }
-    std.debug.print("rebuilt maglev table for vip_id={d}: {d} healthy backend(s)\n", .{ vip_id, ids.items.len });
+    info("rebuilt maglev table for vip_id={d}: {d} healthy backend(s)", .{ vip_id, ids.items.len });
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +340,9 @@ fn cmdAttach(flags: Flags) !void {
     }
     if (ret != 0) fatal("bpf_xdp_attach on {s} (ifindex {d}) failed: {d}. Native XDP needs NIC driver support; try --mode generic.", .{ iface, ifindex, ret });
 
-    std.debug.print(
+    info(
         \\attached xdp_lb_prog to {s} (ifindex {d}) in {s} mode
         \\maps pinned under {s}
-        \\
     , .{ iface, ifindex, used_mode, pindir });
 }
 
@@ -327,11 +365,11 @@ fn cmdDetach(flags: Flags) !void {
 
     const ret = c.bpf_xdp_detach(@intCast(ifindex), mode_flags, null);
     if (ret != 0) fatal("bpf_xdp_detach failed: {d}", .{ret});
-    std.debug.print("detached xdp program from {s}\n", .{iface});
+    info("detached xdp program from {s}", .{iface});
 
     if (flags.has("--purge")) {
         purgePinDir(pindir);
-        std.debug.print("removed pinned maps under {s}\n", .{pindir});
+        info("removed pinned maps under {s}", .{pindir});
     }
 }
 
@@ -350,14 +388,14 @@ fn cmdVipAdd(flags: Flags) !void {
     key.vip_port = std.mem.nativeToBig(u16, port_num);
     key.proto = proto;
 
-    var info = std.mem.zeroes(c.struct_vip_info);
-    info.vip_id = vip_id;
-    info.backend_count = 0;
+    var vinfo = std.mem.zeroes(c.struct_vip_info);
+    vinfo.vip_id = vip_id;
+    vinfo.backend_count = 0;
 
-    if (c.bpf_map_update_elem(maps.vip, &key, &info, c.BPF_NOEXIST) != 0)
+    if (c.bpf_map_update_elem(maps.vip, &key, &vinfo, c.BPF_NOEXIST) != 0)
         fatal("vip already exists (or vip_map update failed)", .{});
 
-    std.debug.print("added vip {s}:{d}/{s} -> vip_id {d}\n", .{ flags.getReq("--vip"), port_num, protoName(proto), vip_id });
+    info("added vip {s}:{d}/{s} -> vip_id {d}", .{ flags.getReq("--vip"), port_num, protoName(proto), vip_id });
 }
 
 fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
@@ -397,7 +435,7 @@ fn cmdBackendAdd(allocator: std.mem.Allocator, flags: Flags) !void {
     vinfo.backend_count += 1;
     _ = c.bpf_map_update_elem(maps.vip, &vkey, &vinfo, c.BPF_EXIST);
 
-    std.debug.print("added backend_id {d}: {s} (mac {s}) via {s} for vip_id {d}\n", .{
+    info("added backend_id {d}: {s} (mac {s}) via {s} for vip_id {d}", .{
         backend_id, flags.getReq("--addr"), flags.getReq("--mac"), egress_iface, vinfo.vip_id,
     });
 
@@ -420,7 +458,7 @@ fn cmdBackendSet(allocator: std.mem.Allocator, flags: Flags) !void {
     if (up) be.flags |= c.BACKEND_FLAG_HEALTHY else be.flags &= ~@as(u8, c.BACKEND_FLAG_HEALTHY);
     if (c.bpf_map_update_elem(maps.backend, &id, &be, c.BPF_EXIST) != 0) fatal("update failed", .{});
 
-    std.debug.print("backend {d} marked {s}\n", .{ id, if (up) "UP" else "DOWN" });
+    info("backend {d} marked {s}", .{ id, if (up) "UP" else "DOWN" });
     try rebuildMaglev(allocator, maps, be.vip_id);
 }
 
@@ -429,7 +467,7 @@ fn cmdList(flags: Flags) !void {
     const maps = Maps.open(pindir);
     defer maps.close();
 
-    std.debug.print("VIPs:\n", .{});
+    info("VIPs:", .{});
     var vkey: c.struct_vip_key = undefined;
     var vnext: c.struct_vip_key = undefined;
     var have_vkey = false;
@@ -438,16 +476,16 @@ fn cmdList(flags: Flags) !void {
         if (c.bpf_map_get_next_key(maps.vip, key_ptr, &vnext) != 0) break;
         vkey = vnext;
         have_vkey = true;
-        var info: c.struct_vip_info = undefined;
-        if (c.bpf_map_lookup_elem(maps.vip, &vkey, &info) != 0) continue;
+        var vinfo: c.struct_vip_info = undefined;
+        if (c.bpf_map_lookup_elem(maps.vip, &vkey, &vinfo) != 0) continue;
         var ipbuf: [16]u8 = undefined;
         const ipstr = try ipToStr(&ipbuf, vkey.vip_addr);
-        std.debug.print("  vip_id={d}  {s}:{d}/{s}  backends={d}\n", .{
-            info.vip_id, ipstr, std.mem.bigToNative(u16, vkey.vip_port), protoName(vkey.proto), info.backend_count,
+        info("  vip_id={d}  {s}:{d}/{s}  backends={d}", .{
+            vinfo.vip_id, ipstr, std.mem.bigToNative(u16, vkey.vip_port), protoName(vkey.proto), vinfo.backend_count,
         });
     }
 
-    std.debug.print("Backends:\n", .{});
+    info("Backends:", .{});
     var bkey: u32 = undefined;
     var bnext: u32 = undefined;
     var have_bkey = false;
@@ -462,9 +500,9 @@ fn cmdList(flags: Flags) !void {
         const ipstr = try ipToStr(&ipbuf, be.addr);
         var macbuf: [18]u8 = undefined;
         const macstr = try macToStr(&macbuf, be.mac);
-        std.debug.print("  id={d}  {s}:{d}/{s}  mac={s}  egress_ifindex={d}  vip_id={d}  {s}\n", .{
-            bkey, ipstr, std.mem.bigToNative(u16, be.port), protoName(be.proto), macstr, be.ifindex_egress, be.vip_id,
-            if (be.flags & c.BACKEND_FLAG_HEALTHY != 0) "UP" else "DOWN",
+        const state = if (be.flags & c.BACKEND_FLAG_HEALTHY != 0) "UP" else "DOWN";
+        info("  id={d}  {s}:{d}/{s}  mac={s}  egress_ifindex={d}  vip_id={d}  {s}", .{
+            bkey, ipstr, std.mem.bigToNative(u16, be.port), protoName(be.proto), macstr, be.ifindex_egress, be.vip_id, state,
         });
     }
 }
@@ -502,7 +540,7 @@ fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
         const db = if (first) 0 else cur.bytes - prev.bytes;
         const pps = @as(f64, @floatFromInt(dp)) / interval_s;
         const bps = @as(f64, @floatFromInt(db)) / interval_s;
-        std.debug.print("packets={d:>12} bytes={d:>14} dropped={d:>10} passed={d:>10}  |  {d:>12.0} pps  {d:>10.2} Mbps\n", .{
+        info("packets={d:>12} bytes={d:>14} dropped={d:>10} passed={d:>10}  |  {d:>12.0} pps  {d:>10.2} Mbps", .{
             cur.packets, cur.bytes, cur.dropped, cur.passed, pps, bps * 8.0 / 1_000_000.0,
         });
         prev = cur;
@@ -529,7 +567,7 @@ fn checkTcpHealthy(addr_be: u32, port_be: u16, timeout_ms: i32) bool {
     sa.sin_addr.s_addr = addr_be;
 
     const ret = c.connect(sock, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in));
-    if (ret != 0 and c.__errno_location().* != c.EINPROGRESS) return false;
+    if (ret != 0 and std.c._errno().* != c.EINPROGRESS) return false;
 
     var pfd = [_]c.struct_pollfd{.{ .fd = sock, .events = c.POLLOUT, .revents = 0 }};
     const n = c.poll(&pfd, 1, timeout_ms);
@@ -549,11 +587,11 @@ fn cmdHealthcheck(allocator: std.mem.Allocator, flags: Flags) !void {
     const maps = Maps.open(pindir);
     defer maps.close();
 
-    std.debug.print("healthcheck loop started (interval={d}s, tcp timeout={d}ms)\n", .{ interval_s, timeout_ms });
+    info("healthcheck loop started (interval={d}s, tcp timeout={d}ms)", .{ interval_s, timeout_ms });
 
     while (true) {
-        var dirty_vips = std.array_list.Managed(u32).init(allocator);
-        defer dirty_vips.deinit();
+        var dirty_vips = std.ArrayList(u32).empty;
+        defer dirty_vips.deinit(allocator);
 
         var key: u32 = undefined;
         var next_key: u32 = undefined;
@@ -578,12 +616,12 @@ fn cmdHealthcheck(allocator: std.mem.Allocator, flags: Flags) !void {
                 _ = c.bpf_map_update_elem(maps.backend, &key, &be, c.BPF_EXIST);
                 var ipbuf: [16]u8 = undefined;
                 const ipstr = ipToStr(&ipbuf, be.addr) catch "?";
-                std.debug.print("backend {d} ({s}) transitioned to {s}\n", .{ key, ipstr, if (now_healthy) "UP" else "DOWN" });
+                info("backend {d} ({s}) transitioned to {s}", .{ key, ipstr, if (now_healthy) "UP" else "DOWN" });
                 var found = false;
                 for (dirty_vips.items) |v| {
                     if (v == be.vip_id) found = true;
                 }
-                if (!found) try dirty_vips.append(be.vip_id);
+                if (!found) try dirty_vips.append(allocator, be.vip_id);
             }
         }
 
@@ -596,7 +634,7 @@ fn cmdHealthcheck(allocator: std.mem.Allocator, flags: Flags) !void {
 }
 
 fn printUsage() void {
-    std.debug.print(
+    info(
         \\ringzero -- control plane for the XDP load balancer
         \\
         \\usage:
@@ -608,17 +646,20 @@ fn printUsage() void {
         \\  ringzero list [--pindir DIR]
         \\  ringzero stats [--watch] [--interval SEC] [--pindir DIR]
         \\  ringzero healthcheck [--interval SEC] [--timeout-ms MS] [--pindir DIR]
-        \\
     , .{});
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    const allocator = std.heap.smp_allocator;
+pub fn main(init: std.process.Init) !void {
+    io = init.io;
+    stdout_file = std.Io.File.stdout().writer(io, &stdout_buf);
+    out = &stdout_file.interface;
+    // One-shot commands never need to free. The loops in healthcheck and
+    // stats --watch free in LIFO order, which is what an arena reclaims.
+    const allocator = init.arena.allocator();
 
-    var arg_it = init.args.iterate();
-    var argv_list = std.array_list.Managed([]const u8).init(allocator);
-    defer argv_list.deinit();
-    while (arg_it.next()) |a| try argv_list.append(a);
+    var arg_it = init.minimal.args.iterate();
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    while (arg_it.next()) |a| try argv_list.append(allocator, a);
     const argv = argv_list.items;
 
     if (argv.len < 2) {

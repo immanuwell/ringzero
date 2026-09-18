@@ -12,7 +12,6 @@ pub const c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
     @cInclude("net/if.h");
-    @cInclude("arpa/inet.h");
     @cInclude("linux/if_link.h");
     @cInclude("bpf/libbpf.h");
     @cInclude("bpf/bpf.h");
