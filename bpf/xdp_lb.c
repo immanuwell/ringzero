@@ -37,6 +37,10 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define ETH_P_IP 0x0800
 
+/* Offset bits of iph->frag_off plus MF. DF (0x4000) stays outside it, so
+ * ordinary don't-fragment traffic is unaffected. */
+#define IP_FRAG_MASK 0x3fff
+
 /* ---- Maps -------------------------------------------------------------- */
 
 struct {
@@ -146,6 +150,14 @@ int xdp_lb_prog(struct xdp_md *ctx)
         return XDP_PASS;
     if (iph->ihl < 5)
         return XDP_DROP;
+
+    /* Only the first fragment carries L4 ports, and sending it to a backend
+     * while the rest goes to the kernel just strands both halves. Leave the
+     * whole datagram to the kernel. */
+    if (iph->frag_off & bpf_htons(IP_FRAG_MASK)) {
+        bump_passed();
+        return XDP_PASS;
+    }
 
     /* We don't support IP options in the fast path — bail to the kernel. */
     void *l4 = (void *)iph + (iph->ihl * 4);
