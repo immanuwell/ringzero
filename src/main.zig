@@ -792,83 +792,223 @@ fn cmdStats(allocator: std.mem.Allocator, flags: Flags) !void {
     }
 }
 
-/// TCP-only health checking: attempts a short, non-blocking connect() to
-/// each backend's (addr, port). UDP backends have no reliable protocol-level
-/// reachability probe without an application-specific echo, so they are
-/// always treated as healthy here -- flip them manually with `backend-set`
-/// if you need to simulate a failure in the demo. A real deployment would
-/// plug in an app-aware check here (HTTP /healthz, a UDP echo, etc.).
-fn checkTcpHealthy(addr_be: u32, port_be: u16, timeout_ms: i32) bool {
-    const sock = c.socket(c.AF_INET, c.SOCK_STREAM | c.SOCK_NONBLOCK, 0);
-    if (sock < 0) return false;
-    defer _ = c.close(sock);
+/// What makes a backend slot the same backend from one health round to the
+/// next.
+fn identity(be: c.struct_backend) u64 {
+    return @as(u64, be.addr) << 32 | @as(u64, be.port) << 8 | be.proto;
+}
 
-    var sa = std.mem.zeroes(c.struct_sockaddr_in);
-    sa.sin_family = c.AF_INET;
-    sa.sin_port = port_be;
-    sa.sin_addr.s_addr = addr_be;
+const Probe = struct {
+    id: u32,
+    be: c.struct_backend,
+    sock: c_int = -1,
+    pfd_idx: usize = 0,
+    up: bool = false,
+    /// False when the probe never happened (non-TCP backend, or a local
+    /// failure like EMFILE). Those must not count as the backend being down.
+    probed: bool = false,
+};
 
-    const ret = c.connect(sock, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in));
-    if (ret != 0 and std.c._errno().* != c.EINPROGRESS) return false;
+/// TCP-only health checking. UDP backends have no reliable protocol-level
+/// reachability probe without an application-specific echo, so they are left
+/// alone here -- flip them manually with `backend-set` if you need to simulate
+/// a failure in the demo. A real deployment would plug in an app-aware check
+/// here (HTTP /healthz, a UDP echo, etc.).
+///
+/// All connects are started before anything is waited on, so a round costs
+/// one timeout rather than one per backend.
+fn probeAll(allocator: std.mem.Allocator, probes: []Probe, timeout_ms: i32) !void {
+    var pfds = std.ArrayList(c.struct_pollfd).empty;
+    defer pfds.deinit(allocator);
 
-    var pfd = [_]c.struct_pollfd{.{ .fd = sock, .events = c.POLLOUT, .revents = 0 }};
-    const n = c.poll(&pfd, 1, timeout_ms);
-    if (n <= 0) return false;
+    defer for (probes) |*p| {
+        if (p.sock >= 0) {
+            _ = c.close(p.sock);
+            p.sock = -1;
+        }
+    };
 
-    var opt: c_int = 0;
-    var opt_len: c.socklen_t = @sizeOf(c_int);
-    if (c.getsockopt(sock, c.SOL_SOCKET, c.SO_ERROR, @ptrCast(&opt), &opt_len) != 0) return false;
-    return opt == 0;
+    for (probes) |*p| {
+        // No generic UDP reachability probe exists, so leave those alone
+        // entirely -- forcing them healthy would undo `backend-set --down`.
+        // Port 0 is the wildcard-VIP marker, not a port to connect to.
+        if (p.be.proto != c.IPPROTO_TCP_ or p.be.port == 0) continue;
+
+        const sock = c.socket(c.AF_INET, c.SOCK_STREAM | c.SOCK_NONBLOCK, 0);
+        if (sock < 0) continue;
+
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = p.be.port;
+        sa.sin_addr.s_addr = p.be.addr;
+
+        if (c.connect(sock, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) == 0) {
+            p.up = true;
+            p.probed = true;
+            _ = c.close(sock);
+            continue;
+        }
+        const err = std.c._errno().*;
+        if (err != c.EINPROGRESS) {
+            // Refused or unreachable is the backend's answer. Anything else,
+            // like EADDRNOTAVAIL or a local firewall, is this host's problem.
+            p.probed = err == c.ECONNREFUSED or err == c.ENETUNREACH or
+                err == c.EHOSTUNREACH or err == c.ETIMEDOUT;
+            _ = c.close(sock);
+            continue;
+        }
+        p.sock = sock;
+        p.pfd_idx = pfds.items.len;
+        try pfds.append(allocator, .{ .fd = sock, .events = c.POLLOUT, .revents = 0 });
+    }
+
+    if (pfds.items.len == 0) return;
+
+    // poll() returns as soon as *one* fd is ready, so a single call would give
+    // every backend slower than the fastest an effective timeout of zero. Keep
+    // waiting on the stragglers until the deadline, retiring each fd as it
+    // finishes (a negative fd makes poll skip it).
+    const ready = try allocator.alloc(bool, pfds.items.len);
+    defer allocator.free(ready);
+    @memset(ready, false);
+
+    var pending = pfds.items.len;
+    var remaining = timeout_ms;
+    var poll_failed = false;
+    while (pending > 0 and remaining > 0) {
+        const started = std.Io.Clock.awake.now(io);
+        const n = c.poll(pfds.items.ptr, @intCast(pfds.items.len), remaining);
+        const err = std.c._errno().*;
+        const elapsed_ms = @divTrunc(started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds, 1_000_000);
+        remaining -= @max(@as(i32, @intCast(elapsed_ms)), 1);
+        if (n < 0) {
+            // A signal is not an answer about any backend.
+            if (err == c.EINTR) continue;
+            poll_failed = true;
+            break;
+        }
+        if (n == 0) break; // genuine timeout
+        for (pfds.items, ready) |*pfd, *done| {
+            if (done.* or pfd.revents == 0) continue;
+            done.* = true;
+            pfd.fd = ~pfd.fd;
+            pending -= 1;
+        }
+    }
+
+    for (probes) |*p| {
+        if (p.sock < 0) continue;
+        // SO_ERROR is 0 on a connect that simply hasn't finished, so "did poll
+        // ever report it" is what separates connected from timed out.
+        if (!ready[p.pfd_idx]) {
+            // A timeout is an answer; poll() erroring out is not.
+            p.probed = !poll_failed;
+            continue;
+        }
+        var opt: c_int = 0;
+        var opt_len: c.socklen_t = @sizeOf(c_int);
+        if (c.getsockopt(p.sock, c.SOL_SOCKET, c.SO_ERROR, @ptrCast(&opt), &opt_len) != 0) continue;
+        p.up = opt == 0;
+        p.probed = true;
+    }
 }
 
 fn cmdHealthcheck(allocator: std.mem.Allocator, flags: Flags) !void {
     const pindir = flags.getDefault("--pindir", default_pindir);
-    const interval_s = try std.fmt.parseFloat(f64, flags.getDefault("--interval", "2.0"));
-    const timeout_ms = try std.fmt.parseInt(i32, flags.getDefault("--timeout-ms", "300"), 10);
+    const interval_s = std.fmt.parseFloat(f64, flags.getDefault("--interval", "2.0")) catch fatal("invalid --interval", .{});
+    // Negative reaches @intFromFloat on an unsigned type; 0 spins.
+    if (!(interval_s > 0) or interval_s > 3600) fatal("--interval must be between 0 and 3600 seconds", .{});
+    const timeout_ms = std.fmt.parseInt(i32, flags.getDefault("--timeout-ms", "300"), 10) catch fatal("invalid --timeout-ms", .{});
+    // 0 would leave every connect unfinished and take every backend down.
+    if (timeout_ms < 1) fatal("--timeout-ms must be >= 1", .{});
+
+    // Default 1/1 is upstream behaviour: one probe decides. Raise them to
+    // ride out a dropped SYN without reshuffling the table.
+    const fall = std.fmt.parseInt(i32, flags.getDefault("--fall", "1"), 10) catch fatal("invalid --fall", .{});
+    const rise = std.fmt.parseInt(i32, flags.getDefault("--rise", "1"), 10) catch fatal("invalid --rise", .{});
+    if (fall < 1 or rise < 1) fatal("--rise and --fall must be >= 1", .{});
 
     const maps = Maps.open(pindir);
     defer maps.close();
 
-    info("healthcheck loop started (interval={d}s, tcp timeout={d}ms)", .{ interval_s, timeout_ms });
+    info("healthcheck loop started (interval={d}s, tcp timeout={d}ms, rise={d}, fall={d})", .{ interval_s, timeout_ms, rise, fall });
+
+    // Consecutive identical results per backend id: positive counts ups,
+    // negative counts downs. A single dropped SYN shouldn't pull a backend out
+    // and reshuffle the table. `owner` records whose streak it is, since ids
+    // are handed out again after a backend-del.
+    var streak = [_]i32{0} ** c.MAX_BACKENDS;
+    var owner = [_]u64{0} ** c.MAX_BACKENDS;
 
     while (true) {
-        var dirty_vips = std.ArrayList(u32).empty;
-        defer dirty_vips.deinit(allocator);
+        var probes = std.ArrayList(Probe).empty;
+        defer probes.deinit(allocator);
 
-        var key: u32 = undefined;
-        var next_key: u32 = undefined;
-        var have_key = false;
-        while (true) {
-            const key_ptr: ?*u32 = if (have_key) &key else null;
-            if (c.bpf_map_get_next_key(maps.backend, key_ptr, &next_key) != 0) break;
-            key = next_key;
-            have_key = true;
+        var it = BackendIter{ .fd = maps.backend };
+        while (it.next()) |e| {
+            try probes.append(allocator, .{ .id = e.id, .be = e.be });
+        }
 
-            var be: c.struct_backend = undefined;
-            if (c.bpf_map_lookup_elem(maps.backend, &key, &be) != 0) continue;
+        try probeAll(allocator, probes.items, timeout_ms);
 
-            const was_healthy = be.flags & c.BACKEND_FLAG_HEALTHY != 0;
-            const now_healthy = if (be.proto == c.IPPROTO_TCP_)
-                checkTcpHealthy(be.addr, be.port, timeout_ms)
-            else
-                true;
+        // Skip the round if the lock is busy: exiting would leave dead backends
+        // in the table for good. Scoped so the lock is not held across the
+        // sleep below.
+        if (tryLockControlPlane()) |lock| {
+            defer unlockControlPlane(lock);
 
-            if (now_healthy != was_healthy) {
-                if (now_healthy) be.flags |= c.BACKEND_FLAG_HEALTHY else be.flags &= ~@as(u8, c.BACKEND_FLAG_HEALTHY);
-                _ = c.bpf_map_update_elem(maps.backend, &key, &be, c.BPF_EXIST);
+            var dirty_vips = std.ArrayList(u32).empty;
+            defer dirty_vips.deinit(allocator);
+
+            for (probes.items) |p| {
+                if (p.id >= c.MAX_BACKENDS) continue;
+                if (!p.probed) continue;
+
+                // Re-read: the probe ran outside the lock, so the snapshot in
+                // `p` may describe a backend that has since been deleted or
+                // replaced, and writing it back would resurrect it.
+                var be = getBackend(maps.backend, p.id) orelse continue;
+                const who = identity(be);
+                if (who != identity(p.be)) continue;
+                // An id deleted and re-added between rounds looks unchanged
+                // within one, so the streak has to remember its owner.
+                if (owner[p.id] != who) {
+                    owner[p.id] = who;
+                    streak[p.id] = 0;
+                }
+
+                // Clamped: past rise/fall the count says nothing more, and
+                // left alone it would eventually overflow.
+                const prev = streak[p.id];
+                streak[p.id] = if (p.up)
+                    (if (prev > 0) @min(prev + 1, rise) else 1)
+                else
+                    (if (prev < 0) @max(prev - 1, -fall) else -1);
+
+                const was_healthy = be.flags & c.BACKEND_FLAG_HEALTHY != 0;
+                const want = if (streak[p.id] >= rise) true else if (streak[p.id] <= -fall) false else was_healthy;
+                if (want == was_healthy) continue;
+
+                if (want) be.flags |= c.BACKEND_FLAG_HEALTHY else be.flags &= ~@as(u8, c.BACKEND_FLAG_HEALTHY);
+                var slot = p.id;
+                if (c.bpf_map_update_elem(maps.backend, &slot, &be, c.BPF_EXIST) != 0) continue;
+
                 var ipbuf: [16]u8 = undefined;
                 const ipstr = ipToStr(&ipbuf, be.addr) catch "?";
-                info("backend {d} ({s}) transitioned to {s}", .{ key, ipstr, if (now_healthy) "UP" else "DOWN" });
+                info("backend {d} ({s}) transitioned to {s}", .{ p.id, ipstr, if (want) "UP" else "DOWN" });
+
                 var found = false;
                 for (dirty_vips.items) |v| {
                     if (v == be.vip_id) found = true;
                 }
                 if (!found) try dirty_vips.append(allocator, be.vip_id);
             }
-        }
 
-        for (dirty_vips.items) |vip_id| {
-            try rebuildMaglev(allocator, maps, vip_id);
+            for (dirty_vips.items) |vip_id| {
+                try rebuildMaglev(allocator, maps, vip_id);
+            }
+        } else {
+            std.debug.print("warning: {s} busy, skipping this round\n", .{lock_path});
         }
 
         _ = c.usleep(@intFromFloat(interval_s * 1_000_000.0));
@@ -889,7 +1029,7 @@ fn printUsage() void {
         \\  ringzero vip-del --vip IP --port PORT --proto tcp|udp [--pindir DIR]
         \\  ringzero list [--pindir DIR]
         \\  ringzero stats [--watch] [--interval SEC] [--pindir DIR]
-        \\  ringzero healthcheck [--interval SEC] [--timeout-ms MS] [--pindir DIR]
+        \\  ringzero healthcheck [--interval SEC] [--timeout-ms MS] [--rise N] [--fall N] [--pindir DIR]
     , .{});
 }
 
