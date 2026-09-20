@@ -1,0 +1,50 @@
+static_resources:
+  listeners:
+  - name: ringzero_udp_listener
+    address:
+      socket_address:
+        address: 10.99.0.1
+        port_value: 9000
+        protocol: UDP
+    reuse_port: true
+    udp_listener_config:
+      downstream_socket_config:
+        max_rx_datagram_size: 1500
+    listener_filters:
+    - name: envoy.filters.udp_listener.udp_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.udp.udp_proxy.v3.UdpProxyConfig
+        stat_prefix: ringzero_udp
+        matcher:
+          on_no_match:
+            action:
+              name: route
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.udp.udp_proxy.v3.Route
+                cluster: ringzero_backends
+
+  clusters:
+  - name: ringzero_backends
+    connect_timeout: 1s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: ringzero_backends
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 10.20.0.2
+                port_value: 9000
+        - endpoint:
+            address:
+              socket_address:
+                address: 10.30.0.2
+                port_value: 9000
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901

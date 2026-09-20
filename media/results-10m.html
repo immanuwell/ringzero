@@ -1,0 +1,453 @@
+<!doctype html>
+<title>ring 0, under load</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Source+Sans+3:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    color-scheme: light;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+
+    --bg: #f2f4f5;
+    --surface: #ffffff;
+    --surface-2: #eceef0;
+    --ink: #12151a;
+    --ink-2: #4c535c;
+    --ink-muted: #868e97;
+    --border: rgba(18,21,26,0.10);
+    --accent: #2a5f96;
+    --copper: #a8620f;
+
+    --series-1: #2a78d6;
+    --series-1-wash: rgba(42,120,214,0.12);
+    --series-2: #1baf7a;
+    --series-3: #eb6834;
+    --series-4: #9457c9;
+
+    --grid: #e2e4e6;
+    --baseline: #c7cace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0e1013;
+      --surface: #16191d;
+      --surface-2: #1d2126;
+      --ink: #f2f3f2;
+      --ink-2: #c3c6ca;
+      --ink-muted: #8b929a;
+      --border: rgba(255,255,255,0.10);
+      --accent: #5b9bdb;
+      --copper: #d99a4e;
+
+      --series-1: #3987e5;
+      --series-1-wash: rgba(57,135,229,0.16);
+      --series-2: #29c48e;
+      --series-3: #e8814f;
+      --series-4: #ab7ddb;
+
+      --grid: #2a2e33;
+      --baseline: #3a3f45;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0e1013;
+    --surface: #16191d;
+    --surface-2: #1d2126;
+    --ink: #f2f3f2;
+    --ink-2: #c3c6ca;
+    --ink-muted: #8b929a;
+    --border: rgba(255,255,255,0.10);
+    --accent: #5b9bdb;
+    --copper: #d99a4e;
+
+    --series-1: #3987e5;
+    --series-1-wash: rgba(57,135,229,0.16);
+    --series-2: #29c48e;
+    --series-3: #e8814f;
+    --series-4: #ab7ddb;
+
+    --grid: #2a2e33;
+    --baseline: #3a3f45;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Source Sans 3", -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    padding-inline: 20px;
+    padding-block: 28px;
+  }
+  .mono { font-family: "JetBrains Mono", ui-monospace, "SF Mono", Consolas, monospace; }
+  main {
+    max-width: 780px;
+    margin-inline: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .stat .value {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 800;
+    font-size: clamp(40px, 8vw, 56px);
+    letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+  .stat .value .unit { font-size: 0.4em; color: var(--ink-muted); font-weight: 600; margin-left: 4px; }
+  .stat .label { font-size: 14.5px; color: var(--ink-muted); line-height: 1.4; max-width: 50ch; }
+
+  .callout {
+    font-size: 13.5px;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    border-left: 3px solid var(--copper);
+    padding: 12px 14px;
+    border-radius: 0 8px 8px 0;
+    line-height: 1.55;
+  }
+  .callout strong { color: var(--ink); }
+
+  section.chart { display: flex; flex-direction: column; gap: 10px; }
+  section.chart .head { display: flex; flex-direction: column; gap: 4px; }
+  section.chart h2 {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0;
+    color: var(--ink);
+  }
+  section.chart h2 .idx { color: var(--ink-muted); font-weight: 500; margin-right: 8px; }
+  section.chart .dek { font-size: 14.5px; color: var(--ink-2); max-width: 68ch; }
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px 12px;
+  }
+  .chart-card svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart-scroll { overflow-x: auto; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: var(--ink-2); margin-bottom: 4px; }
+  .legend .item { display: flex; align-items: center; gap: 7px; }
+  .legend .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+
+  .axis-label { fill: var(--ink-muted); font-size: 11.5px; font-family: "JetBrains Mono", monospace; }
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .baseline-line { stroke: var(--baseline); stroke-width: 1; }
+
+  .tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--ink);
+    color: var(--bg);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    padding: 6px 9px;
+    border-radius: 6px;
+    line-height: 1.5;
+    opacity: 0;
+    transition: opacity 0.08s ease;
+    z-index: 40;
+    white-space: nowrap;
+  }
+  .tooltip.show { opacity: 1; }
+  .tooltip .t-title { font-weight: 700; }
+  .tooltip .t-row { color: var(--bg); opacity: 0.82; }
+  .hit { cursor: pointer; }
+
+  .theme-toggle {
+    position: fixed;
+    top: calc(16px + env(safe-area-inset-top, 0px));
+    right: 16px;
+    z-index: 50;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 7px 12px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    color: var(--ink-2);
+    cursor: pointer;
+  }
+  .theme-toggle:hover { color: var(--ink); border-color: var(--border-strong, var(--border)); }
+  .theme-toggle .icon { font-size: 13px; line-height: 1; }
+
+  details.data-table { font-size: 13.5px; }
+  details.data-table > summary {
+    cursor: pointer;
+    color: var(--ink-muted);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    padding: 6px 2px;
+    user-select: none;
+  }
+  details.data-table > summary:hover { color: var(--ink-2); }
+  details.data-table table {
+    border-collapse: collapse;
+    margin-top: 8px;
+    font-variant-numeric: tabular-nums;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12.5px;
+    width: 100%;
+  }
+  details.data-table th, details.data-table td {
+    text-align: right;
+    padding: 5px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--ink-2);
+  }
+  details.data-table th:first-child, details.data-table td:first-child { text-align: left; color: var(--ink); }
+  details.data-table thead th { color: var(--ink-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+</style>
+
+<button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme">
+  <span class="icon" id="theme-toggle-icon">&#9728;&#65039;</span>
+  <span id="theme-toggle-label">Light</span>
+</button>
+
+<main>
+
+  <div class="stat">
+    <div class="value">~9.1<span class="unit">M pps</span></div>
+    <div class="label">
+      ringzero, 8 RPS-steered veth RX queues, zero drops. One queue alone caps around 1.9M:
+      the floodgen sender runs out of steam there, not XDP.
+    </div>
+  </div>
+
+  <div class="callout">
+    NGINX and Envoy are userspace proxies. Every packet crosses <code class="mono">recvfrom</code>/<code class="mono">sendto</code>,
+    a kernel/userspace copy, and real per-flow session state before it reaches their code.
+    ringzero's XDP program runs before any of that exists, no socket, no <code class="mono">sk_buff</code>.
+    That's the entire gap in the chart below, not a verdict on which proxy is better: NGINX and
+    Envoy do TLS termination, HTTP routing, health checks, and observability that ringzero has
+    none of, and this test gives them no credit for any of it. HAProxy isn't in the chart because
+    it has no generic UDP passthrough, only QUIC/HTTP-3 termination, which a raw UDP flood can't
+    exercise.
+  </div>
+
+  <section class="chart" id="chart-throughput">
+    <div class="head">
+      <h2><span class="idx">01</span>Sustained throughput, one flood, 15 seconds</h2>
+      <p class="dek">
+        Same netns/veth rig, same backends, one <code class="mono">floodgen</code> run per target.
+        ringzero's number is its own eBPF map counter. NGINX and Envoy are read off TX packet
+        counters on the backend-facing veths, since neither exposes an equivalent counter of its
+        own. Both got real tuning: NGINX with multiple <code class="mono">reuseport</code> workers
+        and bumped socket buffers, Envoy with <code class="mono">--concurrency 16</code>.
+      </p>
+    </div>
+    <div class="chart-card">
+      <div class="legend">
+        <div class="item"><span class="swatch" style="background:var(--series-1)"></span>ringzero (XDP), 16 threads offered &mdash; 0% dropped</div>
+        <div class="item"><span class="swatch" style="background:var(--series-2)"></span>NGINX stream, 32 threads offered &mdash; ~70% dropped</div>
+        <div class="item"><span class="swatch" style="background:var(--series-3)"></span>Envoy udp_proxy, 32 threads offered &mdash; ~79% dropped</div>
+      </div>
+      <div class="chart-scroll">
+        <svg id="svg-throughput" viewBox="0 0 860 320" role="img" aria-label="Line chart comparing sustained packets per second over 15 seconds: ringzero near 9 million, NGINX near 1.1 million, Envoy near 0.8 million"></svg>
+      </div>
+    </div>
+    <details class="data-table">
+      <summary>Data table</summary>
+      <table id="table-throughput"></table>
+    </details>
+  </section>
+
+</main>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------------- theme toggle ----------------
+  (function () {
+    const root = document.documentElement;
+    const btn = document.getElementById("theme-toggle");
+    const icon = document.getElementById("theme-toggle-icon");
+    const label = document.getElementById("theme-toggle-label");
+    const STORAGE_KEY = "ringzero-results-theme";
+
+    function systemPrefersDark() {
+      return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    }
+    function effectiveTheme() {
+      const explicit = root.getAttribute("data-theme");
+      if (explicit === "light" || explicit === "dark") return explicit;
+      return systemPrefersDark() ? "dark" : "light";
+    }
+    function render() {
+      const eff = effectiveTheme();
+      if (eff === "dark") {
+        icon.textContent = "\u{1F319}";
+        label.textContent = "Dark";
+      } else {
+        icon.textContent = "☀️";
+        label.textContent = "Light";
+      }
+    }
+    function apply(theme) {
+      if (theme) root.setAttribute("data-theme", theme);
+      else root.removeAttribute("data-theme");
+      render();
+    }
+
+    let stored = null;
+    try { stored = localStorage.getItem(STORAGE_KEY); } catch (e) {}
+    apply(stored === "light" || stored === "dark" ? stored : null);
+
+    btn.addEventListener("click", () => {
+      const next = effectiveTheme() === "dark" ? "light" : "dark";
+      apply(next);
+      try { localStorage.setItem(STORAGE_KEY, next); } catch (e) {}
+    });
+  })();
+
+  const tooltip = document.getElementById("tooltip");
+  function showTip(evt, title, rows) {
+    tooltip.innerHTML = '<div class="t-title">' + title + '</div>' +
+      rows.map(r => '<div class="t-row">' + r + '</div>').join("");
+    tooltip.classList.add("show");
+    moveTip(evt);
+  }
+  function moveTip(evt) {
+    const pad = 14;
+    let x = evt.clientX + pad;
+    let y = evt.clientY + pad;
+    const rect = tooltip.getBoundingClientRect();
+    if (x + rect.width > window.innerWidth - 8) x = evt.clientX - rect.width - pad;
+    if (y + rect.height > window.innerHeight - 8) y = evt.clientY - rect.height - pad;
+    tooltip.style.left = x + "px";
+    tooltip.style.top = y + "px";
+  }
+  function hideTip() { tooltip.classList.remove("show"); }
+
+  const NS = "http://www.w3.org/2000/svg";
+  function el(tag, attrs) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function fmt(n) { return Math.round(n).toLocaleString("en-US"); }
+  function fmtM(n) { return n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : (n / 1e3).toFixed(0) + "K"; }
+
+  const series = [
+    {
+      name: "ringzero", color: "var(--series-1)", fillWash: "var(--series-1-wash)",
+      data: [
+        [0.0,0],[0.5,0],[1.0,0],[1.5,8320404],[2.0,9810998],[2.5,9711172],[3.0,9588150],
+        [3.5,9734296],[4.0,9739276],[4.5,8825060],[5.0,8464400],[5.5,8913630],[6.0,8664408],
+        [6.5,9180862],[7.0,8618482],[7.5,8981958],[8.0,8450962],[8.5,9102442],[9.0,8424726],
+        [9.5,8220320],[10.0,8910190],[10.5,9672232],[11.0,8986302],[11.5,8483214],[12.0,8731270],
+        [12.5,9497296],[13.0,9667930],[13.5,9671702],[14.0,9657332],[14.5,9716902],[15.0,9655266],
+        [15.5,9735942],[16.0,9303938]
+      ]
+    },
+    {
+      name: "NGINX", color: "var(--series-2)",
+      data: [
+        [0.0,0],[0.5,0],[1.0,947360],[1.5,1133156],[2.0,1111762],[2.5,1184754],[3.0,1059044],
+        [3.5,1084516],[4.0,1093592],[4.5,1113756],[5.0,1115164],[5.5,1082788],[6.0,1229122],
+        [6.5,1163974],[7.0,1157928],[7.5,1151238],[8.0,1117112],[8.5,1115242],[9.0,1114556],
+        [9.5,1168406],[10.0,1093816],[10.5,1139046],[11.0,1219480],[11.5,1143532],[12.0,1141832],
+        [12.5,1154774],[13.0,1149688],[13.5,1158542],[14.0,1087342],[14.5,922030],[15.0,0],[15.5,0]
+      ]
+    },
+    {
+      name: "Envoy", color: "var(--series-3)",
+      data: [
+        [0.0,0],[0.5,0],[1.0,597104],[1.5,823640],[2.0,836132],[2.5,788602],[3.0,782200],
+        [3.5,816580],[4.0,786052],[4.5,805290],[5.0,833174],[5.5,773250],[6.0,839820],
+        [6.5,895822],[7.0,887280],[7.5,809666],[8.0,811460],[8.5,819488],[9.0,838698],
+        [9.5,809464],[10.0,854522],[10.5,832826],[11.0,841692],[11.5,849656],[12.0,833130],
+        [12.5,813434],[13.0,825516],[13.5,853634],[14.0,833704],[14.5,893488],[15.0,114398],[15.5,0]
+      ]
+    }
+  ];
+
+  const svg = document.getElementById("svg-throughput");
+  const W = 860, H = 320, ML = 64, MR = 16, MT = 16, MB = 34;
+  const plotW = W - ML - MR, plotH = H - MT - MB;
+  const xMax = 16.0;
+  const yMax = 11000000;
+  const x = t => ML + (t / xMax) * plotW;
+  const y = v => MT + plotH - (v / yMax) * plotH;
+
+  const yTicks = [0, 2500000, 5000000, 7500000, 10000000];
+  yTicks.forEach(v => {
+    svg.appendChild(el("line", { x1: ML, x2: W - MR, y1: y(v), y2: y(v), class: "grid-line" }));
+    const t = el("text", { x: ML - 10, y: y(v) + 4, "text-anchor": "end", class: "axis-label" });
+    t.textContent = (v / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+    svg.appendChild(t);
+  });
+  const yAxisTitle = el("text", {
+    x: 14, y: MT + plotH / 2, "text-anchor": "middle", class: "axis-label",
+    "font-weight": "700", transform: "rotate(-90 14 " + (MT + plotH / 2) + ")"
+  });
+  yAxisTitle.textContent = "packets / sec (pps)";
+  svg.appendChild(yAxisTitle);
+  svg.appendChild(el("line", { x1: ML, x2: ML, y1: MT, y2: MT + plotH, class: "baseline-line" }));
+  svg.appendChild(el("line", { x1: ML, x2: W - MR, y1: MT + plotH, y2: MT + plotH, class: "baseline-line" }));
+  [0, 2, 4, 6, 8, 10, 12, 14, 16].forEach(t => {
+    const lbl = el("text", { x: x(t), y: H - 10, "text-anchor": "middle", class: "axis-label" });
+    lbl.textContent = t + "s";
+    svg.appendChild(lbl);
+  });
+
+  series.forEach(s => {
+    if (s.fillWash) {
+      let areaD = "M " + x(s.data[0][0]) + " " + y(0);
+      s.data.forEach(d => { areaD += " L " + x(d[0]) + " " + y(d[1]); });
+      areaD += " L " + x(s.data[s.data.length - 1][0]) + " " + y(0) + " Z";
+      svg.appendChild(el("path", { d: areaD, fill: s.fillWash, stroke: "none" }));
+    }
+  });
+
+  series.forEach(s => {
+    let lineD = "M " + x(s.data[0][0]) + " " + y(s.data[0][1]);
+    s.data.slice(1).forEach(d => { lineD += " L " + x(d[0]) + " " + y(d[1]); });
+    svg.appendChild(el("path", { d: lineD, fill: "none", stroke: s.color, "stroke-width": "2", "stroke-linejoin": "round", "stroke-linecap": "round" }));
+
+    s.data.forEach(d => {
+      const dot = el("circle", { cx: x(d[0]), cy: y(d[1]), r: 7, fill: "transparent", class: "hit" });
+      dot.addEventListener("mouseenter", e => {
+        showTip(e, s.name + " @ " + d[0].toFixed(1) + "s", [fmt(d[1]) + " pps"]);
+        svg.appendChild(el("circle", { cx: x(d[0]), cy: y(d[1]), r: 4, fill: s.color, stroke: "var(--surface)", "stroke-width": 2, class: "hover-dot" }));
+      });
+      dot.addEventListener("mousemove", moveTip);
+      dot.addEventListener("mouseleave", () => { hideTip(); svg.querySelectorAll(".hover-dot").forEach(n => n.remove()); });
+      svg.appendChild(dot);
+    });
+  });
+
+  const table = document.getElementById("table-throughput");
+  const times = series[0].data.map(d => d[0]);
+  table.innerHTML = "<thead><tr><th>Time</th>" + series.map(s => "<th>" + s.name + "</th>").join("") + "</tr></thead><tbody>" +
+    times.map((t, i) => "<tr><td>" + t.toFixed(1) + "s</td>" + series.map(s => "<td>" + fmt(s.data[i][1]) + "</td>").join("") + "</tr>").join("") +
+    "</tbody>";
+})();
+</script>
